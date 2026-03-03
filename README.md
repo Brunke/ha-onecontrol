@@ -58,7 +58,7 @@ Legacy PIN gateways use a BLE passkey exchange during bonding that requires dir
 
 The integration registers a BlueZ D-Bus agent that provides the passkey automatically during bonding. No manual steps required beyond entering the PIN in the config flow. This path is confirmed working.
 
-**Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host.
+**Compatible hardware:** the Raspberry Pi's built-in Bluetooth adapter, or any USB Bluetooth dongle recognized by the HA host. To extend range as much as possible, a USB adapter with an antenna is highly recommended.
 
 ### ESPHome Bluetooth Proxy (not supported for PIN gateways)
 
