@@ -41,8 +41,12 @@ from .const import (
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
     CAN_WRITE_CHAR_UUID,
+    CONNECTION_TYPE_ETHERNET,
+    CONF_CONNECTION_TYPE,
     CONF_BLUETOOTH_PIN,
     CONF_BONDED_SOURCE,
+    CONF_ETH_HOST,
+    CONF_ETH_PORT,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
@@ -136,6 +140,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self.address: str = entry.data[CONF_ADDRESS]
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
+        self._connection_type: str = entry.data.get(CONF_CONNECTION_TYPE, "ble")
+        self._eth_host: str = entry.data.get(CONF_ETH_HOST, "")
+        self._eth_port: int = int(entry.data.get(CONF_ETH_PORT, 0) or 0)
 
         # ── PIN-based pairing (legacy gateways) ──────────────────────
         self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
@@ -155,6 +162,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._current_connect_source: str | None = None
 
         self._client: BleakClient | None = None
+        self._eth_reader: asyncio.StreamReader | None = None
+        self._eth_writer: asyncio.StreamWriter | None = None
+        self._ethernet_reader_task: asyncio.Task | None = None
         self._decoder = CobsByteDecoder(use_crc=True)
         self._cmd = CommandBuilder()
         self._authenticated = False
@@ -258,7 +268,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def connected(self) -> bool:
+        if self.is_ethernet_gateway:
+            return self._connected and self._eth_writer is not None
         return self._connected and self._client is not None
+
+    @property
+    def is_ethernet_gateway(self) -> bool:
+        """Return True if this entry uses the Ethernet bridge transport."""
+        return self._connection_type == CONNECTION_TYPE_ETHERNET
 
     @property
     def authenticated(self) -> bool:
@@ -299,6 +316,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_send_command(self, raw_command: bytes) -> None:
         """COBS-encode and write a command to the gateway."""
+        if self.is_ethernet_gateway:
+            if not self._eth_writer or not self._connected:
+                raise ConnectionError("Not connected to Ethernet bridge")
+            encoded = cobs_encode(raw_command)
+            _LOGGER.debug("TX Ethernet command (%d bytes raw): %s", len(raw_command), raw_command.hex())
+            self._eth_writer.write(encoded)
+            await self._eth_writer.drain()
+            return
+
         if not self._client or not self._connected:
             raise BleakError("Not connected to gateway")
         encoded = cobs_encode(raw_command)
@@ -548,6 +574,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._last_lockout_clear = now
 
+        if self.is_ethernet_gateway:
+            _LOGGER.warning("Lockout clear over Ethernet bridge is not implemented")
+            return
+
         if not self._client or not self._connected:
             raise BleakError("Not connected to gateway")
 
@@ -618,6 +648,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cancel_reconnect()
         self._connected = False
         self._authenticated = False
+        if self.is_ethernet_gateway:
+            await self._close_ethernet_transport()
+            self._decoder.reset()
+            return
         if self._client:
             try:
                 await self._client.disconnect()
@@ -628,6 +662,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _do_connect(self) -> None:
         """Internal connect routine with retry logic."""
+        if self.is_ethernet_gateway:
+            await self._do_connect_ethernet()
+            return
+
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
@@ -731,6 +769,104 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # All paths exhausted
         raise last_exc
+
+    async def _do_connect_ethernet(self) -> None:
+        """Connect to an IDS CAN-to-Ethernet bridge with retries."""
+        max_attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._try_connect_ethernet(attempt)
+                return
+            except Exception as exc:
+                last_exc = exc
+                _LOGGER.warning(
+                    "Ethernet connection attempt %d/%d failed: %s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                await self._close_ethernet_transport()
+                self._connected = False
+                self._authenticated = False
+                if attempt < max_attempts:
+                    delay = 2 * attempt
+                    _LOGGER.info("Retrying Ethernet in %ds...", delay)
+                    await asyncio.sleep(delay)
+
+        assert last_exc is not None
+        raise last_exc
+
+    async def _try_connect_ethernet(self, attempt: int) -> None:
+        """Open TCP connection to Ethernet bridge and start reader task."""
+        host = self._eth_host or self.address
+        port = self._eth_port
+        if not host or port <= 0:
+            raise ConnectionError("Ethernet host/port are not configured")
+
+        _LOGGER.info(
+            "Connecting to OneControl bridge %s:%d (attempt %d)",
+            host,
+            port,
+            attempt,
+        )
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host=host, port=port),
+            timeout=10.0,
+        )
+
+        self._eth_reader = reader
+        self._eth_writer = writer
+        self._connected = True
+        self._authenticated = True
+        self._decoder.reset()
+        self.async_set_updated_data(self._build_data())
+
+        self._ethernet_reader_task = self.hass.async_create_background_task(
+            self._ethernet_read_loop(),
+            "ha_onecontrol_ethernet_reader",
+        )
+        self._start_heartbeat()
+        self.hass.async_create_task(self._send_initial_get_devices())
+
+    async def _ethernet_read_loop(self) -> None:
+        """Read Ethernet bytes and decode COBS frames into protocol events."""
+        if self._eth_reader is None:
+            return
+
+        try:
+            while self._connected and self._eth_reader is not None:
+                chunk = await self._eth_reader.read(512)
+                if not chunk:
+                    raise ConnectionError("Ethernet bridge closed connection")
+                for byte_val in chunk:
+                    frame = self._decoder.decode_byte(byte_val)
+                    if frame is not None:
+                        self._process_frame(frame)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Ethernet read loop ended: %s", exc)
+        finally:
+            if self._connected:
+                self._handle_transport_disconnect("ethernet")
+
+    async def _close_ethernet_transport(self) -> None:
+        """Close active Ethernet socket and reader task."""
+        if self._ethernet_reader_task and not self._ethernet_reader_task.done():
+            self._ethernet_reader_task.cancel()
+            self._ethernet_reader_task = None
+
+        if self._eth_writer is not None:
+            self._eth_writer.close()
+            try:
+                await self._eth_writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._eth_reader = None
+        self._eth_writer = None
 
     @property
     def is_pin_gateway(self) -> bool:
@@ -1762,7 +1898,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data: dict[str, Any] = {
             "connected": self._connected,
             "authenticated": self._authenticated,
+            "connection_type": self._connection_type,
         }
+        if self.is_ethernet_gateway:
+            data["eth_host"] = self._eth_host
+            data["eth_port"] = self._eth_port
         if self.rv_status:
             data["voltage"] = self.rv_status.voltage
             data["temperature"] = self.rv_status.temperature
@@ -1778,6 +1918,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _on_disconnect(self, client: BleakClient) -> None:
         """Handle unexpected BLE disconnect — schedule reconnect with backoff."""
+        self._handle_transport_disconnect("ble")
+
+    def _handle_transport_disconnect(self, transport: str) -> None:
+        """Handle unexpected transport disconnect and schedule reconnect."""
         _LOGGER.warning("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
         self._stop_heartbeat()
         self._connected = False
@@ -1802,6 +1946,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ctx = self._pin_agent_ctx
             self._pin_agent_ctx = None
             self.hass.async_create_task(ctx.cleanup())
+
+        if transport == "ethernet":
+            if self._eth_writer is not None:
+                self._eth_writer.close()
+            self._eth_reader = None
+            self._eth_writer = None
+            if self._ethernet_reader_task and not self._ethernet_reader_task.done():
+                self._ethernet_reader_task.cancel()
+            self._ethernet_reader_task = None
 
         self.async_set_updated_data(self._build_data())
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -14,9 +15,17 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS
 
 from .const import (
+    CONNECTION_TYPE_BLE,
+    CONNECTION_TYPE_ETHERNET,
+    CONF_CONNECTION_TYPE,
     CONF_BLUETOOTH_PIN,
+    CONF_ETH_HOST,
+    CONF_ETH_PORT,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
+    DEFAULT_ETH_HOST,
+    DEFAULT_ETH_PORT,
+    ETH_DISCOVERY_LISTEN_SECS,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
     GATEWAY_NAME_PREFIX,
@@ -24,6 +33,7 @@ from .const import (
     LIPPERT_MANUFACTURER_ID_ALT,
 )
 from .protocol.advertisement import PairingMethod
+from .protocol.ethernet_discovery import discover_can_ethernet_bridges
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +49,9 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self._address: str | None = None
         self._name: str | None = None
         self._pairing_method: PairingMethod = PairingMethod.UNKNOWN
+        self._connection_type: str = CONNECTION_TYPE_BLE
+        self._eth_host: str = DEFAULT_ETH_HOST
+        self._eth_port: int = DEFAULT_ETH_PORT
 
     # ------------------------------------------------------------------
     # Bluetooth discovery entry point
@@ -72,6 +85,30 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
+        if user_input is not None:
+            self._connection_type = user_input[CONF_CONNECTION_TYPE]
+            if self._connection_type == CONNECTION_TYPE_ETHERNET:
+                return await self.async_step_ethernet()
+            return await self.async_step_user_ble()
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_CONNECTION_TYPE, default=CONNECTION_TYPE_BLE): vol.In(
+                        {
+                            CONNECTION_TYPE_BLE: "Bluetooth gateway",
+                            CONNECTION_TYPE_ETHERNET: "CAN-to-Ethernet bridge",
+                        }
+                    )
+                }
+            ),
+        )
+
+    async def async_step_user_ble(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle manual BLE gateway selection."""
         if user_input is not None:
             # User picked a device from the list
             address = user_input[CONF_ADDRESS]
@@ -107,11 +144,106 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="no_devices_found")
 
         return self.async_show_form(
-            step_id="user",
+            step_id="user_ble",
             data_schema=vol.Schema(
                 {vol.Required(CONF_ADDRESS): vol.In(devices)}
             ),
         )
+
+    async def async_step_ethernet(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Configure an IDS CAN-to-Ethernet bridge endpoint."""
+        errors: dict[str, str] = {}
+
+        if user_input is None:
+            discovered = await discover_can_ethernet_bridges(ETH_DISCOVERY_LISTEN_SECS)
+            if discovered:
+                self._name = discovered[0].name
+                self._eth_host = discovered[0].host
+                self._eth_port = discovered[0].port
+                _LOGGER.debug(
+                    "Ethernet discovery selected bridge: name=%s host=%s port=%d (candidates=%d)",
+                    self._name,
+                    self._eth_host,
+                    self._eth_port,
+                    len(discovered),
+                )
+            else:
+                _LOGGER.debug(
+                    "Ethernet discovery found no bridge advertisements; using defaults host=%s port=%d",
+                    self._eth_host,
+                    self._eth_port,
+                )
+
+        if user_input is not None:
+            host = str(user_input[CONF_ETH_HOST]).strip()
+            port = user_input[CONF_ETH_PORT]
+            pin = str(user_input.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)).strip()
+
+            if not host:
+                errors[CONF_ETH_HOST] = "invalid_host"
+            elif not isinstance(port, int) or port < 1 or port > 65535:
+                errors[CONF_ETH_PORT] = "invalid_port"
+            elif pin and (len(pin) != 6 or not pin.isdigit()):
+                errors[CONF_GATEWAY_PIN] = "invalid_pin"
+            elif not await self._async_can_connect_ethernet(host, int(port)):
+                errors["base"] = "cannot_connect"
+            else:
+                unique_id = f"eth:{host}:{port}"
+                await self.async_set_unique_id(unique_id)
+                self._abort_if_unique_id_configured()
+
+                self._eth_host = host
+                self._eth_port = int(port)
+                self._address = host
+                self._name = self._name or f"OneControl Ethernet {host}"
+
+                return self.async_create_entry(
+                    title=self._name,
+                    data={
+                        CONF_CONNECTION_TYPE: CONNECTION_TYPE_ETHERNET,
+                        CONF_ETH_HOST: self._eth_host,
+                        CONF_ETH_PORT: self._eth_port,
+                        CONF_ADDRESS: self._eth_host,
+                        CONF_GATEWAY_PIN: pin or DEFAULT_GATEWAY_PIN,
+                        CONF_PAIRING_METHOD: PairingMethod.NONE.value,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="ethernet",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ETH_HOST, default=self._eth_host): str,
+                    vol.Required(CONF_ETH_PORT, default=self._eth_port): int,
+                    vol.Optional(CONF_GATEWAY_PIN, default=DEFAULT_GATEWAY_PIN): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "default_host": DEFAULT_ETH_HOST,
+                "default_port": str(DEFAULT_ETH_PORT),
+            },
+        )
+
+    async def _async_can_connect_ethernet(self, host: str, port: int) -> bool:
+        """Return True if the configured Ethernet endpoint is reachable."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host=host, port=port),
+                timeout=3.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Ethernet connectivity probe failed for %s:%d: %s", host, port, exc)
+            return False
+
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     # ------------------------------------------------------------------
     # Pairing method selection
@@ -161,6 +293,7 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 data = {
                     CONF_ADDRESS: self._address,
+                    CONF_CONNECTION_TYPE: CONNECTION_TYPE_BLE,
                     CONF_GATEWAY_PIN: pin,
                     CONF_PAIRING_METHOD: self._pairing_method.value,
                 }

@@ -33,6 +33,9 @@ async def async_get_config_entry_diagnostics(
         "connected": coordinator.connected,
         "authenticated": coordinator.authenticated,
         "data_healthy": coordinator.data_healthy,
+        "connection_type": getattr(coordinator, "_connection_type", "ble"),
+        "eth_host": getattr(coordinator, "_eth_host", None),
+        "eth_port": getattr(coordinator, "_eth_port", None),
         "last_event_age_seconds": (
             round(coordinator.last_event_age, 1)
             if coordinator.last_event_age is not None
@@ -40,7 +43,7 @@ async def async_get_config_entry_diagnostics(
         ),
         "pairing_method": coordinator._pairing_method,
         "is_pin_gateway": coordinator.is_pin_gateway,
-        "pin_bond_attempted": coordinator._pin_bond_attempted,
+        "pin_bond_attempted": getattr(coordinator, "_pin_dbus_succeeded", False),
         "has_can_write": coordinator._has_can_write,
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
         "pending_metadata_cmdids": len(coordinator._pending_metadata_cmdids),
@@ -107,9 +110,9 @@ async def async_get_config_entry_diagnostics(
         hvacs[key] = {
             "heat_mode": zone.heat_mode,
             "fan_mode": zone.fan_mode,
-            "current_temp": zone.current_temp,
-            "low_trip": zone.low_trip,
-            "high_trip": zone.high_trip,
+            "current_temp": zone.indoor_temp_f,
+            "low_trip": zone.low_trip_f,
+            "high_trip": zone.high_trip_f,
             "name": coordinator.device_name(zone.table_id, zone.device_id),
         }
 
