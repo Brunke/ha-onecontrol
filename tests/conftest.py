@@ -1,10 +1,10 @@
 """Shared test fixtures.
 
-Stubs out homeassistant and related packages so the protocol-layer tests
-can import ``custom_components.onecontrol.protocol.*`` without a full
-Home Assistant installation.
+Stubs optional dependencies only when they are unavailable in the active
+environment so tests can run both with and without Home Assistant installed.
 """
 
+import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -40,4 +40,7 @@ _STUBS = [
 ]
 
 for _name in _STUBS:
-    sys.modules.setdefault(_name, _StubModule(name=_name))
+    try:
+        importlib.import_module(_name)
+    except Exception:  # noqa: BLE001
+        sys.modules.setdefault(_name, _StubModule(name=_name))

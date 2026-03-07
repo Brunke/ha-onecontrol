@@ -28,6 +28,7 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 | - | - |
 | **Push-to-Pair** | Has a physical "Connect" button on the RV control panel |
 | **PIN (legacy)** | No Connect button — uses only the 6-digit PIN sticker |
+| **CAN-to-Ethernet Bridge (experimental)** | IDS / CAN_TO_ETHERNET_GATEWAY on your local network |
 
 
 ### Push-to-Pair gateways (newer)
@@ -77,6 +78,24 @@ This approach is experimental. If you are attempting this, use the `pairing\_te
 - Flash the pairing helper to the **exact device** that will serve as the proxy — bonds are not transferable between ESP32 units
 
 - OTA-flash the production proxy firmware **without erasing flash** after bonding
+
+## Experimental: CAN-to-Ethernet Bridge
+
+The integration now includes an experimental Ethernet path for older OneControl
+systems that expose CAN traffic through an IDS CAN-to-Ethernet bridge.
+
+1. In config flow, select **CAN-to-Ethernet bridge** as the connection type.
+
+2. The integration listens for UDP advertisements and pre-fills host/port when found.
+
+3. If discovery does not find the bridge, enter host and port manually.
+
+Default bridge values are commonly `192.168.1.1` and `6969`.
+
+The current implementation assumes payload framing compatibility with the BLE
+COBS protocol path. If your bridge wraps frames differently, bridge-specific
+framing support will be needed.
+
 ## Supported Devices
 
 - **Switches** — Relay-controlled devices (lights, water pump, water heaters, tank heater)

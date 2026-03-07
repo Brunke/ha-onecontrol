@@ -1,13 +1,14 @@
 """Tests for TEA encryption — verify against known values from the Android app."""
 
-from custom_components.onecontrol.protocol.tea import (
+from custom_components.ha_onecontrol.protocol.tea import (
     MASK32,
+    STEP1_CIPHER,
+    STEP2_CIPHER,
     calculate_step1_key,
     calculate_step2_key,
     tea_decrypt,
     tea_encrypt,
 )
-from custom_components.onecontrol.const import STEP1_CIPHER, STEP2_CIPHER
 
 
 class TestTeaEncrypt:

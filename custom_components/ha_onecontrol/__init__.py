@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
-from .coordinator import OneControlCoordinator
+
+if TYPE_CHECKING:
+    from .coordinator import OneControlCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +97,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up OneControl from a config entry."""
+    from .coordinator import OneControlCoordinator
+
     hass.data.setdefault(DOMAIN, {})
 
     existing: OneControlCoordinator | None = hass.data[DOMAIN].get(entry.entry_id)
@@ -130,6 +135,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    from .coordinator import OneControlCoordinator
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:

@@ -23,12 +23,12 @@ from homeassistant.components.light import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .entity_helpers import build_gateway_device_info
 from .protocol.commands import CommandBuilder
 from .protocol.events import DimmableLight, RgbLight
 
@@ -119,12 +119,9 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_light_{device_id:02x}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
         self._unsub = coordinator.register_event_callback(self._on_event)
 
@@ -266,12 +263,9 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
         self._attr_unique_id = f"{mac}_rgb_{device_id:02x}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, address)},
-            name=f"OneControl {address}",
-            manufacturer="Lippert / LCI",
-            model="BLE Gateway",
-            connections={("bluetooth", address)},
+        self._attr_device_info = build_gateway_device_info(
+            address,
+            getattr(coordinator, "_connection_type", "ble"),
         )
         self._unsub = coordinator.register_event_callback(self._on_event)
 
