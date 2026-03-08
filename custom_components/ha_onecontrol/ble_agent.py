@@ -158,6 +158,78 @@ def is_pin_pairing_supported() -> bool:
     return _DBUS_AVAILABLE
 
 
+async def async_is_locally_bonded(device_address: str) -> bool:
+    """Return True if BlueZ has a local bond (LTK) for *device_address*.
+
+    This is used at connection time to decide whether to prefer a local HCI
+    adapter over an ESPHome BT proxy.  A local bond means the link key lives
+    in BlueZ on this host — connecting through a proxy would strip encryption
+    and may cause the gateway to terminate the link with INSUF_AUTH.
+
+    Returns False if D-Bus is unavailable (non-Linux) or BlueZ has no entry
+    for the device.
+    """
+    if not _DBUS_AVAILABLE:
+        return False
+
+    from dbus_fast import BusType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            device_path = await _find_device_path(bus, device_address)
+            if not device_path:
+                return False
+            return await _is_paired(bus, device_path)
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        _LOGGER.debug("async_is_locally_bonded(%s) failed: %s", device_address, exc)
+        return False
+
+
+async def async_get_local_adapter_macs() -> set[str]:
+    """Return the Bluetooth MAC addresses of all local BlueZ HCI adapters.
+
+    Queries ``org.bluez.Adapter1`` objects via D-Bus ObjectManager.
+    Returns an empty set if D-Bus is unavailable or on any error.
+    """
+    if not _DBUS_AVAILABLE:
+        return set()
+
+    from dbus_fast import BusType, Message, MessageType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    ADAPTER_IFACE = "org.bluez.Adapter1"
+    macs: set[str] = set()
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            reply = await bus.call(
+                Message(
+                    destination=BLUEZ_SERVICE,
+                    path="/",
+                    interface=OBJECT_MANAGER_IFACE,
+                    member="GetManagedObjects",
+                )
+            )
+            if reply.message_type != MessageType.ERROR and reply.body:
+                objects: dict = reply.body[0]
+                for interfaces in objects.values():
+                    if ADAPTER_IFACE in interfaces:
+                        addr = interfaces[ADAPTER_IFACE].get("Address")
+                        if addr is not None:
+                            if hasattr(addr, "value"):
+                                addr = addr.value
+                            macs.add(str(addr).upper())
+        finally:
+            bus.disconnect()
+    except Exception as exc:
+        _LOGGER.debug("async_get_local_adapter_macs failed: %s", exc)
+    return macs
+
+
 class PinAgentContext:
     """Holds a registered D-Bus PIN agent that is waiting for a pair() call.
 

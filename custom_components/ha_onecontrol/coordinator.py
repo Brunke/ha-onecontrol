@@ -33,6 +33,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .ble_agent import (
     PinAgentContext,
+    async_get_local_adapter_macs,
+    async_is_locally_bonded,
     is_pin_pairing_supported,
     pair_push_button,
     prepare_pin_agent,
@@ -756,11 +758,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         # ── Source-pinning: prefer the adapter where the bond lives ─────────
-        # After the first successful authentication we persist the source (HA
-        # scanner ID — either an hciX adapter MAC or an ESPHome proxy name).
-        # On every subsequent connect we filter scanner candidates to that
-        # source, guaranteeing the connection goes through the adapter that
-        # holds the BLE bond (LTK), preventing ATT auth failures on proxies.
+        # CONF_BONDED_SOURCE records the HA scanner source (hciX adapter MAC
+        # or ESPHome proxy name) that carries the BLE bond (LTK).  For bonds
+        # created via local BlueZ D-Bus pairing the LTK lives on the local
+        # adapter — connecting through a proxy would produce an unencrypted
+        # link, causing INSUF_AUTH (status=5) on secured characteristics and
+        # a gateway-initiated disconnect (error 19).  We therefore check BlueZ
+        # at connect time and, when a local bond exists, always prefer a local
+        # HCI scanner candidate over any proxy — regardless of what
+        # CONF_BONDED_SOURCE currently stores.
         device = None
         self._current_connect_source = None
         bonded_source: str | None = self.entry.options.get(CONF_BONDED_SOURCE)
@@ -772,7 +778,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:  # API unavailable on this HA version
             candidates = []
 
-        if bonded_source and candidates:
+        # Check whether BlueZ holds a local bond for this device.  If so,
+        # prefer a local HCI adapter scanner over any proxy — the LTK is only
+        # usable via the local radio.
+        locally_bonded = await async_is_locally_bonded(self.address)
+        local_macs = await async_get_local_adapter_macs()
+        candidate_sources = [c.scanner.source for c in candidates]
+        _LOGGER.debug(
+            "Bond check %s: locally_bonded=%s local_macs=%s candidate_sources=%s",
+            self.address, locally_bonded, local_macs, candidate_sources,
+        )
+        if locally_bonded and candidates:
+            local_candidate = next(
+                (c for c in candidates
+                 if c.scanner.source.upper().replace(":", "") in
+                    {m.replace(":", "") for m in local_macs}),
+                None,
+            )
+            if local_candidate is not None:
+                device = local_candidate.ble_device
+                self._current_connect_source = local_candidate.scanner.source
+                _LOGGER.info(
+                    "Connecting to %s via local HCI adapter %s (local BlueZ bond)",
+                    self.address, self._current_connect_source,
+                )
+            else:
+                _LOGGER.debug(
+                    "Local BlueZ bond for %s but no local HCI scanner candidate "
+                    "(local_macs=%s, candidate_sources=%s) — falling back",
+                    self.address, local_macs, candidate_sources,
+                )
+
+        if device is None and bonded_source and candidates:
             preferred = next(
                 (c for c in candidates if c.scanner.source == bonded_source), None
             )
