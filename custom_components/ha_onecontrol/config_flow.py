@@ -11,8 +11,9 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.helpers import selector
 
 from .const import (
     CONNECTION_TYPE_BLE,
@@ -22,6 +23,10 @@ from .const import (
     CONF_ETH_HOST,
     CONF_ETH_PORT,
     CONF_GATEWAY_PIN,
+    CONF_NAMING_MANIFEST_JSON,
+    CONF_NAMING_MANIFEST_PATH,
+    CONF_NAMING_SNAPSHOT_JSON,
+    CONF_NAMING_SNAPSHOT_PATH,
     CONF_PAIRING_METHOD,
     DEFAULT_ETH_HOST,
     DEFAULT_ETH_PORT,
@@ -32,6 +37,7 @@ from .const import (
     LIPPERT_MANUFACTURER_ID,
     LIPPERT_MANUFACTURER_ID_ALT,
 )
+from .name_catalog import load_external_name_catalog
 from .protocol.advertisement import PairingMethod
 from .protocol.ethernet_discovery import discover_can_ethernet_bridges
 
@@ -42,6 +48,11 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OneControl."""
 
     VERSION = 2
+
+    @staticmethod
+    def async_get_options_flow(config_entry: ConfigEntry) -> OneControlOptionsFlow:
+        """Return the options flow handler."""
+        return OneControlOptionsFlow(config_entry)
 
     def __init__(self) -> None:
         """Initialise flow state."""
@@ -329,3 +340,87 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle the PIN-gateway confirmation step (delegates to confirm)."""
         return await self.async_step_confirm(user_input)
+
+
+class OneControlOptionsFlow(OptionsFlow):
+    """Handle options for OneControl."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage options."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            manifest_path = str(user_input.get(CONF_NAMING_MANIFEST_PATH, "")).strip()
+            snapshot_path = str(user_input.get(CONF_NAMING_SNAPSHOT_PATH, "")).strip()
+            manifest_json = str(user_input.get(CONF_NAMING_MANIFEST_JSON, "")).strip()
+            snapshot_json = str(user_input.get(CONF_NAMING_SNAPSHOT_JSON, "")).strip()
+
+            if manifest_path or snapshot_path or manifest_json or snapshot_json:
+                try:
+                    await self.hass.async_add_executor_job(
+                        load_external_name_catalog,
+                        manifest_path or None,
+                        snapshot_path or None,
+                        manifest_json or None,
+                        snapshot_json or None,
+                    )
+                except Exception:  # noqa: BLE001
+                    errors["base"] = "invalid_naming_file"
+
+            if not errors:
+                options: dict[str, Any] = dict(self._config_entry.options)
+                if manifest_path:
+                    options[CONF_NAMING_MANIFEST_PATH] = manifest_path
+                else:
+                    options.pop(CONF_NAMING_MANIFEST_PATH, None)
+
+                if snapshot_path:
+                    options[CONF_NAMING_SNAPSHOT_PATH] = snapshot_path
+                else:
+                    options.pop(CONF_NAMING_SNAPSHOT_PATH, None)
+
+                if manifest_json:
+                    options[CONF_NAMING_MANIFEST_JSON] = manifest_json
+                else:
+                    options.pop(CONF_NAMING_MANIFEST_JSON, None)
+
+                if snapshot_json:
+                    options[CONF_NAMING_SNAPSHOT_JSON] = snapshot_json
+                else:
+                    options.pop(CONF_NAMING_SNAPSHOT_JSON, None)
+
+                return self.async_create_entry(title="", data=options)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_NAMING_MANIFEST_PATH,
+                        default=self._config_entry.options.get(CONF_NAMING_MANIFEST_PATH, ""),
+                    ): str,
+                    vol.Optional(
+                        CONF_NAMING_SNAPSHOT_PATH,
+                        default=self._config_entry.options.get(CONF_NAMING_SNAPSHOT_PATH, ""),
+                    ): str,
+                    vol.Optional(
+                        CONF_NAMING_MANIFEST_JSON,
+                        default=self._config_entry.options.get(CONF_NAMING_MANIFEST_JSON, ""),
+                    ): selector.TextSelector(
+                        selector.TextSelectorConfig(multiline=True)
+                    ),
+                    vol.Optional(
+                        CONF_NAMING_SNAPSHOT_JSON,
+                        default=self._config_entry.options.get(CONF_NAMING_SNAPSHOT_JSON, ""),
+                    ): selector.TextSelector(
+                        selector.TextSelectorConfig(multiline=True)
+                    ),
+                }
+            ),
+            errors=errors,
+        )

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
-from custom_components.ha_onecontrol.config_flow import OneControlConfigFlow
+from custom_components.ha_onecontrol.config_flow import (
+    OneControlConfigFlow,
+    OneControlOptionsFlow,
+)
 
 
 class _DummyWriter:
@@ -50,3 +54,12 @@ def test_async_can_connect_ethernet_failure(monkeypatch) -> None:
     ok = asyncio.run(flow._async_can_connect_ethernet("192.168.1.1", 6969))
 
     assert ok is False
+
+
+def test_options_flow_init_stores_entry_on_private_attr() -> None:
+    """Options flow init should not write to read-only base config_entry property."""
+    entry = SimpleNamespace(options={})
+
+    flow = OneControlOptionsFlow(entry)  # type: ignore[arg-type]
+
+    assert flow._config_entry is entry

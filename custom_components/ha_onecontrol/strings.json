@@ -57,5 +57,22 @@
       "already_configured": "This gateway is already configured",
       "no_devices_found": "No OneControl gateways found. Make sure Bluetooth is enabled and the gateway is powered on."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "External Device Naming",
+        "description": "Optional: provide OneControl manifest/snapshot JSON content (paste from diagnostics export) or local file paths to improve naming when gateway metadata is unavailable. Pasted JSON takes priority over path input.",
+        "data": {
+          "naming_manifest_path": "Manifest JSON path",
+          "naming_snapshot_path": "Snapshot JSON path",
+          "naming_manifest_json": "Manifest JSON content",
+          "naming_snapshot_json": "Snapshot JSON content"
+        }
+      }
+    },
+    "error": {
+      "invalid_naming_file": "Unable to read or parse the supplied manifest/snapshot file"
+    }
   }
 }
