@@ -47,7 +47,30 @@ async def async_get_config_entry_diagnostics(
         "has_can_write": coordinator._has_can_write,
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
         "pending_metadata_cmdids": len(coordinator._pending_metadata_cmdids),
+        "pending_metadata_sent_at": len(coordinator._pending_metadata_sent_at),
         "pending_get_devices_cmdids": len(coordinator._pending_get_devices_cmdids),
+        "pending_get_devices_sent_at": len(coordinator._pending_get_devices_sent_at),
+        "unknown_command_ids": len(coordinator._unknown_command_counts),
+        "supports_metadata_requests": coordinator._supports_metadata_requests,
+        "naming_manifest_path": getattr(coordinator, "_naming_manifest_path", ""),
+        "naming_snapshot_path": getattr(coordinator, "_naming_snapshot_path", ""),
+        "naming_manifest_json_configured": bool(
+            getattr(coordinator, "_naming_manifest_json", "").strip()
+        ),
+        "naming_snapshot_json_configured": bool(
+            getattr(coordinator, "_naming_snapshot_json", "").strip()
+        ),
+        "external_name_catalog_entries": getattr(
+            getattr(coordinator, "_external_name_catalog", None),
+            "entries",
+            0,
+        ),
+        "identity_rows_cached": len(getattr(coordinator, "_device_identities", {})),
+        "ethernet_transport_keepalives_sent": getattr(
+            coordinator, "_ethernet_transport_keepalives_sent", 0
+        ),
+        "disconnect_count": getattr(coordinator, "_disconnect_count", 0),
+        "last_disconnect_reason": getattr(coordinator, "_last_disconnect_reason", None),
         "cmd_correlation": dict(coordinator._cmd_correlation_stats),
     }
 

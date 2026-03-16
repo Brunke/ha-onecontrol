@@ -21,12 +21,13 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
-from bleak import BleakClient, BleakGATTCharacteristic, BleakScanner
+from bleak import BleakClient, BleakScanner
+from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -48,6 +49,10 @@ from .const import (
     CONF_ETH_HOST,
     CONF_ETH_PORT,
     CONF_GATEWAY_PIN,
+    CONF_NAMING_MANIFEST_JSON,
+    CONF_NAMING_MANIFEST_PATH,
+    CONF_NAMING_SNAPSHOT_JSON,
+    CONF_NAMING_SNAPSHOT_PATH,
     CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
     DATA_SERVICE_UUID,
@@ -74,12 +79,14 @@ from .const import (
     UNLOCK_STATUS_CHAR_UUID,
     UNLOCK_VERIFY_DELAY,
 )
+from .name_catalog import ExternalNameCatalog, load_external_name_catalog
 from .protocol.cobs import CobsByteDecoder, cobs_encode
 from .protocol.commands import CommandBuilder
 from .protocol.events import (
     CoverStatus,
     DeviceLock,
     DeviceMetadata,
+    DeviceIdentity,
     DeviceOnline,
     DimmableLight,
     GatewayInformation,
@@ -93,15 +100,19 @@ from .protocol.events import (
     SystemLockout,
     TankLevel,
     parse_event,
-    parse_metadata_response,
 )
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
-from .protocol.function_names import get_friendly_name
 from .protocol.tea import calculate_step1_key, calculate_step2_key
+from .runtime import IdsCanRuntime, MyRvLinkRuntime
 
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_PENDING_GET_DEVICES_CMDIDS = 128
+_MAX_PENDING_METADATA_CMDIDS = 128
+_MAX_UNKNOWN_COMMAND_IDS = 512
+_CMDID_STALE_TIMEOUT_S = 30.0
+_ETHERNET_HEARTBEAT_INTERVAL_S = 2.0
+_ETHERNET_TRANSPORT_KEEPALIVE_INTERVAL_S = 3.0
 
 
 def _device_key(table_id: int, device_id: int) -> str:
@@ -165,6 +176,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._eth_reader: asyncio.StreamReader | None = None
         self._eth_writer: asyncio.StreamWriter | None = None
         self._ethernet_reader_task: asyncio.Task | None = None
+        self._last_ethernet_tx_time: float = 0.0
+        self._ethernet_transport_keepalives_sent: int = 0
+        self._disconnect_count: int = 0
+        self._last_disconnect_reason: str | None = None
+        self._stop_listener = None
+        self._naming_manifest_path: str = entry.options.get(CONF_NAMING_MANIFEST_PATH, "")
+        self._naming_snapshot_path: str = entry.options.get(CONF_NAMING_SNAPSHOT_PATH, "")
+        self._naming_manifest_json: str = entry.options.get(CONF_NAMING_MANIFEST_JSON, "")
+        self._naming_snapshot_json: str = entry.options.get(CONF_NAMING_SNAPSHOT_JSON, "")
+        self._external_name_catalog: ExternalNameCatalog = ExternalNameCatalog()
         self._decoder = CobsByteDecoder(use_crc=True)
         self._cmd = CommandBuilder()
         self._authenticated = False
@@ -176,8 +197,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_rejected_tables: set[int] = set()
         self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._pending_metadata_sent_at: dict[int, float] = {}  # cmdId → monotonic timestamp
         self._pending_metadata_entries: dict[int, dict[str, DeviceMetadata]] = {}
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
+        self._pending_get_devices_sent_at: dict[int, float] = {}  # cmdId → monotonic timestamp
         self._get_devices_loaded_tables: set[int] = set()
         self._unknown_command_counts: dict[int, int] = {}
         self._cmd_correlation_stats: dict[str, int] = {
@@ -185,6 +208,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "metadata_success_multi_discarded_get_devices": 0,
             "metadata_success_multi_discarded_unknown": 0,
             "metadata_entries_staged": 0,
+            "metadata_parse_errors": 0,
             "metadata_commit_success": 0,
             "metadata_commit_crc_mismatch": 0,
             "metadata_commit_count_mismatch": 0,
@@ -193,7 +217,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "command_error_unknown": 0,
             "get_devices_rejected": 0,
             "get_devices_completed": 0,
+            "get_devices_completed_fallback": 0,
+            "get_devices_identity_rows": 0,
+            "get_devices_identity_rows_fallback": 0,
+            "get_devices_identity_parse_empty": 0,
+            "ids_command_candidates_seen": 0,
+            "ids_command_candidates_unmatched": 0,
+            "external_names_applied": 0,
             "pending_get_devices_peak": 0,
+            "frame_parse_errors": 0,
+            "pending_cmdid_pruned": 0,
+            "unknown_cmdids_pruned": 0,
+        }
+        self._frame_family_stats: dict[str, int] = {
+            "myrvlink_state": 0,
+            "myrvlink_command": 0,
+            "ids_can_like": 0,
+            "unknown": 0,
         }
         # Set once the initial GetDevices command has been sent after connection.
         # Metadata requests are delayed until this is True to mirror the v2.7.2
@@ -237,6 +277,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Metadata: friendly names per device key
         self.device_names: dict[str, str] = {}
         self._metadata_raw: dict[str, DeviceMetadata] = {}
+        self._device_identities: dict[str, DeviceIdentity] = {}
+
+        self._load_external_name_catalog()
 
         # Last non-zero brightness per dimmable device (persists across off/on cycles).
         # Mirrors Android lastKnownDimmableBrightness — only updated when brightness > 0.
@@ -257,6 +300,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Entity platform callbacks (typed)
         self._event_callbacks: list[Callable[[Any], None]] = []
+
+        # Protocol runtimes: keep coordinator as HA-facing facade while
+        # transport/protocol orchestration is split by backend.
+        self._ids_runtime = IdsCanRuntime(self)
+        self._myrvlink_runtime = MyRvLinkRuntime(self, self._ids_runtime)
+
+        # Cancel non-critical reconnect/heartbeat tasks as HA stops.
+        if hasattr(self.hass, "bus") and hasattr(self.hass.bus, "async_listen_once"):
+            self._stop_listener = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self._on_hass_stop
+            )
 
     @property
     def instance_tag(self) -> str:
@@ -300,6 +354,53 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         key = _device_key(table_id, device_id)
         return self.device_names.get(key, f"Device {key.upper()}")
 
+    def _load_external_name_catalog(self) -> None:
+        """Load optional manifest/snapshot naming catalogs from config entry options."""
+        manifest_path = self._naming_manifest_path.strip() or None
+        snapshot_path = self._naming_snapshot_path.strip() or None
+        manifest_json = self._naming_manifest_json.strip() or None
+        snapshot_json = self._naming_snapshot_json.strip() or None
+        if not manifest_path and not snapshot_path and not manifest_json and not snapshot_json:
+            self._external_name_catalog = ExternalNameCatalog()
+            return
+
+        try:
+            self._external_name_catalog = load_external_name_catalog(
+                manifest_path,
+                snapshot_path,
+                manifest_json,
+                snapshot_json,
+            )
+            _LOGGER.info(
+                "Loaded external naming catalog: entries=%d manifest_path=%s snapshot_path=%s manifest_json=%s snapshot_json=%s",
+                self._external_name_catalog.entries,
+                manifest_path or "",
+                snapshot_path or "",
+                "yes" if manifest_json else "no",
+                "yes" if snapshot_json else "no",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Failed loading external naming catalog: %s", exc)
+            self._external_name_catalog = ExternalNameCatalog()
+
+    def _apply_external_name(self, key: str, identity: DeviceIdentity) -> None:
+        """Apply external name when identity matches manifest/snapshot catalog."""
+        if self._external_name_catalog.entries == 0:
+            return
+
+        resolved_name = self._external_name_catalog.lookup(
+            identity.device_type,
+            identity.device_instance,
+            identity.product_id,
+            identity.product_mac,
+        )
+        if not resolved_name:
+            return
+
+        if key not in self.device_names:
+            self.device_names[key] = resolved_name
+            self._cmd_correlation_stats["external_names_applied"] += 1
+
     def register_event_callback(self, cb: Callable[[Any], None]) -> Callable[[], None]:
         """Register a callback for parsed events. Returns unsubscribe callable."""
         self._event_callbacks.append(cb)
@@ -309,6 +410,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._event_callbacks.remove(cb)
 
         return _unsub
+
+    def _dispatch_event_update(self, event: Any) -> None:
+        """Protocol-neutral event fan-out + coordinator state publication."""
+        for cb in self._event_callbacks:
+            try:
+                cb(event)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Error in event callback")
+
+        self.async_set_updated_data(self._build_data())
 
     # ------------------------------------------------------------------
     # Command sending (COBS-encoded writes to DATA_WRITE)
@@ -320,9 +431,29 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self._eth_writer or not self._connected:
                 raise ConnectionError("Not connected to Ethernet bridge")
             encoded = cobs_encode(raw_command)
-            _LOGGER.debug("TX Ethernet command (%d bytes raw): %s", len(raw_command), raw_command.hex())
+            cmd_id = int.from_bytes(raw_command[0:2], "little") if len(raw_command) >= 2 else -1
+            cmd_type = raw_command[2] if len(raw_command) >= 3 else -1
+            cmd_name = {
+                0x01: "GetDevices",
+                0x02: "GetDevicesMetadata",
+                0x40: "ActionSwitch",
+                0x41: "ActionHBridge",
+                0x42: "ActionGenerator",
+                0x43: "ActionDimmable",
+                0x44: "ActionRgb",
+                0x45: "ActionHvac",
+            }.get(cmd_type, "Unknown")
+            _LOGGER.warning(
+                "PACKET TX ETH cmd_id=0x%04X type=0x%02X(%s) raw_len=%d raw=%s",
+                cmd_id & 0xFFFF,
+                cmd_type & 0xFF,
+                cmd_name,
+                len(raw_command),
+                raw_command.hex(),
+            )
             self._eth_writer.write(encoded)
             await self._eth_writer.drain()
+            self._last_ethernet_tx_time = time.monotonic()
             return
 
         if not self._client or not self._connected:
@@ -335,6 +466,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, table_id: int, device_id: int, state: bool
     ) -> None:
         """Send a switch on/off command."""
+        if self.is_ethernet_gateway:
+            used_ids_native = await self._ids_runtime.send_relay_toggle_command(
+                table_id,
+                device_id,
+                state,
+            )
+            if used_ids_native:
+                _LOGGER.warning(
+                    "PACKET TX IDS relay-toggle accepted table=0x%02X device=0x%02X state=%s (IDS-only mode)",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                    state,
+                )
+                return
+            _LOGGER.warning(
+                "PACKET TX IDS relay-toggle skipped table=0x%02X device=0x%02X state=%s (IDS-only mode; legacy fallback disabled)",
+                table_id & 0xFF,
+                device_id & 0xFF,
+                state,
+            )
+            return
+
         cmd = self._cmd.build_action_switch(table_id, state, [device_id])
         await self.async_send_command(cmd)
 
@@ -342,6 +495,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, table_id: int, device_id: int, brightness: int
     ) -> None:
         """Send a dimmable light brightness command."""
+        if self.is_ethernet_gateway:
+            used_ids_native = await self._ids_runtime.send_light_toggle_command(
+                table_id,
+                device_id,
+                brightness > 0,
+            )
+            if used_ids_native:
+                _LOGGER.warning(
+                    "PACKET TX IDS light-toggle accepted table=0x%02X device=0x%02X brightness=%d (IDS-only mode)",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                    brightness,
+                )
+                return
+            _LOGGER.warning(
+                "PACKET TX IDS light-toggle skipped table=0x%02X device=0x%02X brightness=%d (IDS-only mode; legacy fallback disabled)",
+                table_id & 0xFF,
+                device_id & 0xFF,
+                brightness,
+            )
+            return
+
         cmd = self._cmd.build_action_dimmable(table_id, device_id, brightness)
         await self.async_send_command(cmd)
 
@@ -602,14 +777,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_refresh_metadata(self) -> None:
         """Re-request device metadata for all known table IDs."""
+        if not self._supports_metadata_requests:
+            _LOGGER.debug(
+                "Skipping metadata refresh for %s: metadata requests disabled on Ethernet/IDS-CAN",
+                self.address,
+            )
+            return
         # Reset per-table state so all tables can be re-requested
         self._metadata_requested_tables.clear()
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
         self._pending_metadata_cmdids.clear()
+        self._pending_metadata_sent_at.clear()
         self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
+        self._pending_get_devices_sent_at.clear()
 
         # Collect all known table IDs: gateway, previously loaded metadata,
         # and all observed device status tables (covers tables we saw via status
@@ -772,106 +955,168 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _do_connect_ethernet(self) -> None:
         """Connect to an IDS CAN-to-Ethernet bridge with retries."""
-        max_attempts = 3
-        last_exc: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
-            try:
-                await self._try_connect_ethernet(attempt)
-                return
-            except Exception as exc:
-                last_exc = exc
-                _LOGGER.warning(
-                    "Ethernet connection attempt %d/%d failed: %s",
-                    attempt,
-                    max_attempts,
-                    exc,
-                )
-                await self._close_ethernet_transport()
-                self._connected = False
-                self._authenticated = False
-                if attempt < max_attempts:
-                    delay = 2 * attempt
-                    _LOGGER.info("Retrying Ethernet in %ds...", delay)
-                    await asyncio.sleep(delay)
-
-        assert last_exc is not None
-        raise last_exc
+        await self._ids_runtime.connect()
 
     async def _try_connect_ethernet(self, attempt: int) -> None:
         """Open TCP connection to Ethernet bridge and start reader task."""
-        host = self._eth_host or self.address
-        port = self._eth_port
-        if not host or port <= 0:
-            raise ConnectionError("Ethernet host/port are not configured")
-
-        _LOGGER.info(
-            "Connecting to OneControl bridge %s:%d (attempt %d)",
-            host,
-            port,
-            attempt,
-        )
-
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host=host, port=port),
-            timeout=10.0,
-        )
-
-        self._eth_reader = reader
-        self._eth_writer = writer
-        self._connected = True
-        self._authenticated = True
-        self._decoder.reset()
-        self.async_set_updated_data(self._build_data())
-
-        self._ethernet_reader_task = self.hass.async_create_background_task(
-            self._ethernet_read_loop(),
-            "ha_onecontrol_ethernet_reader",
-        )
-        self._start_heartbeat()
-        self.hass.async_create_task(self._send_initial_get_devices())
+        await self._ids_runtime._try_connect(attempt)
 
     async def _ethernet_read_loop(self) -> None:
         """Read Ethernet bytes and decode COBS frames into protocol events."""
-        if self._eth_reader is None:
-            return
-
-        try:
-            while self._connected and self._eth_reader is not None:
-                chunk = await self._eth_reader.read(512)
-                if not chunk:
-                    raise ConnectionError("Ethernet bridge closed connection")
-                for byte_val in chunk:
-                    frame = self._decoder.decode_byte(byte_val)
-                    if frame is not None:
-                        self._process_frame(frame)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Ethernet read loop ended: %s", exc)
-        finally:
-            if self._connected:
-                self._handle_transport_disconnect("ethernet")
+        await self._ids_runtime.read_loop()
 
     async def _close_ethernet_transport(self) -> None:
         """Close active Ethernet socket and reader task."""
-        if self._ethernet_reader_task and not self._ethernet_reader_task.done():
-            self._ethernet_reader_task.cancel()
-            self._ethernet_reader_task = None
+        await self._ids_runtime.close_transport()
 
-        if self._eth_writer is not None:
-            self._eth_writer.close()
-            try:
-                await self._eth_writer.wait_closed()
-            except Exception:  # noqa: BLE001
-                pass
+    async def _send_ethernet_transport_keepalive(self) -> None:
+        """Send a transport-level frame delimiter to prevent idle TCP closes."""
+        runtime = getattr(self, "_ids_runtime", None)
+        if runtime is not None:
+            await runtime.send_transport_keepalive(_ETHERNET_TRANSPORT_KEEPALIVE_INTERVAL_S)
+            return
 
-        self._eth_reader = None
-        self._eth_writer = None
+        # Compatibility fallback for tests that invoke this method on a lightweight
+        # stand-in object via OneControlCoordinator._send_ethernet_transport_keepalive(...).
+        if not self.is_ethernet_gateway or not self._connected or self._eth_writer is None:
+            return
+        if (time.monotonic() - self._last_ethernet_tx_time) < _ETHERNET_TRANSPORT_KEEPALIVE_INTERVAL_S:
+            return
+        self._eth_writer.write(b"\x00")
+        await self._eth_writer.drain()
+        self._last_ethernet_tx_time = time.monotonic()
+        self._ethernet_transport_keepalives_sent += 1
+        _LOGGER.debug("TX Ethernet transport keepalive delimiter")
 
     @property
     def is_pin_gateway(self) -> bool:
         """True if this gateway uses PIN-based (legacy) BLE pairing."""
         return self._pairing_method == "pin"
+
+    @property
+    def _supports_metadata_requests(self) -> bool:
+        """True when metadata command path is supported for current transport."""
+        # Legacy IDS-CAN over Ethernet bridges have not shown reliable support
+        # for GetDevicesMetadata in field testing.
+        return not self.is_ethernet_gateway
+
+    def _classify_frame_family(self, frame: bytes) -> str:
+        """Best-effort classifier for mixed protocol captures.
+
+        This is heuristic telemetry for diagnostics, not a strict decoder.
+        """
+        if not frame:
+            return "unknown"
+
+        event_type = frame[0] & 0xFF
+
+        # Known MyRVLink state/event types currently parsed by this integration.
+        if event_type in {
+            0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x1A, 0x1B, 0x20,
+        }:
+            return "myrvlink_state"
+
+        # MyRVLink command response envelope.
+        if event_type == 0x02 and len(frame) >= 4 and (frame[3] & 0xFF) in {0x01, 0x02, 0x81, 0x82}:
+            return "myrvlink_command"
+
+        # IDS-CAN message-type-like values from decompiled references.
+        if event_type in {0x00, 0x80, 0x81, 0x82, 0x83, 0x84, 0x9B, 0x9D, 0x9F}:
+            return "ids_can_like"
+
+        return "unknown"
+
+    def _record_pending_get_devices_cmd(self, cmd_id: int, table_id: int) -> None:
+        """Track an in-flight GetDevices command id with bounded retention."""
+        runtime = getattr(self, "_myrvlink_runtime", None)
+        if runtime is not None:
+            runtime.record_pending_get_devices_cmd(
+                cmd_id,
+                table_id,
+                max_pending=_MAX_PENDING_GET_DEVICES_CMDIDS,
+            )
+            return
+
+        now = time.monotonic()
+        self._pending_get_devices_cmdids[cmd_id] = table_id
+        self._pending_get_devices_sent_at[cmd_id] = now
+        while len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
+            oldest_cmd_id = next(iter(self._pending_get_devices_cmdids))
+            self._pending_get_devices_cmdids.pop(oldest_cmd_id, None)
+            self._pending_get_devices_sent_at.pop(oldest_cmd_id, None)
+            self._cmd_correlation_stats["pending_cmdid_pruned"] += 1
+        self._cmd_correlation_stats["pending_get_devices_peak"] = max(
+            self._cmd_correlation_stats["pending_get_devices_peak"],
+            len(self._pending_get_devices_cmdids),
+        )
+
+    def _record_pending_metadata_cmd(self, cmd_id: int, table_id: int) -> None:
+        """Track an in-flight metadata command id with bounded retention."""
+        runtime = getattr(self, "_myrvlink_runtime", None)
+        if runtime is not None:
+            runtime.record_pending_metadata_cmd(
+                cmd_id,
+                table_id,
+                max_pending=_MAX_PENDING_METADATA_CMDIDS,
+            )
+            return
+
+        now = time.monotonic()
+        self._pending_metadata_cmdids[cmd_id] = table_id
+        self._pending_metadata_sent_at[cmd_id] = now
+        while len(self._pending_metadata_cmdids) > _MAX_PENDING_METADATA_CMDIDS:
+            oldest_cmd_id = next(iter(self._pending_metadata_cmdids))
+            self._pending_metadata_cmdids.pop(oldest_cmd_id, None)
+            self._pending_metadata_sent_at.pop(oldest_cmd_id, None)
+            self._pending_metadata_entries.pop(oldest_cmd_id, None)
+            self._cmd_correlation_stats["pending_cmdid_pruned"] += 1
+
+    def _prune_pending_command_state(self) -> None:
+        """Drop stale pending cmdIds so late/missing responses do not accumulate forever."""
+        runtime = getattr(self, "_myrvlink_runtime", None)
+        if runtime is not None:
+            runtime.prune_pending_command_state(_CMDID_STALE_TIMEOUT_S)
+            return
+
+        cutoff = time.monotonic() - _CMDID_STALE_TIMEOUT_S
+
+        stale_get_devices = [
+            cmd_id
+            for cmd_id, sent_at in self._pending_get_devices_sent_at.items()
+            if sent_at < cutoff
+        ]
+        for cmd_id in stale_get_devices:
+            self._pending_get_devices_sent_at.pop(cmd_id, None)
+            self._pending_get_devices_cmdids.pop(cmd_id, None)
+            self._cmd_correlation_stats["pending_cmdid_pruned"] += 1
+
+        stale_metadata = [
+            cmd_id
+            for cmd_id, sent_at in self._pending_metadata_sent_at.items()
+            if sent_at < cutoff
+        ]
+        for cmd_id in stale_metadata:
+            self._pending_metadata_sent_at.pop(cmd_id, None)
+            self._pending_metadata_cmdids.pop(cmd_id, None)
+            self._pending_metadata_entries.pop(cmd_id, None)
+            self._cmd_correlation_stats["pending_cmdid_pruned"] += 1
+
+    def _bump_unknown_cmd_count(self, cmd_id: int) -> int:
+        """Increment unknown cmdId counter and bound map size."""
+        runtime = getattr(self, "_myrvlink_runtime", None)
+        if runtime is not None:
+            return runtime.bump_unknown_cmd_count(
+                cmd_id,
+                max_unknown=_MAX_UNKNOWN_COMMAND_IDS,
+            )
+
+        count = self._unknown_command_counts.get(cmd_id, 0) + 1
+        self._unknown_command_counts[cmd_id] = count
+        while len(self._unknown_command_counts) > _MAX_UNKNOWN_COMMAND_IDS:
+            self._unknown_command_counts.pop(next(iter(self._unknown_command_counts)))
+            self._cmd_correlation_stats["unknown_cmdids_pruned"] += 1
+        return count
 
     async def _try_connect(self, attempt: int) -> None:
         """Single connection attempt — connect, pair, authenticate."""
@@ -935,11 +1180,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._push_button_dbus_ok = False
 
         if self.is_pin_gateway:
-            # Register the PIN agent NOW so it is waiting when BlueZ asks
-            # for the PIN during client.pair() after GATT connect.
-            # We do NOT call Device1.Pair() here — that is done post-connect,
-            # matching the Android flow: connectGatt() → createBond() in
-            # onConnectionStateChange.
             ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
@@ -1288,18 +1528,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _send_metadata_request(self, table_id: int) -> None:
         """Send GetDevicesMetadata for a single table ID."""
-        cmd = self._cmd.build_get_devices_metadata(table_id)
-        cmd_id = int.from_bytes(cmd[0:2], "little")
-        self._pending_metadata_cmdids[cmd_id] = table_id
-        self._pending_metadata_entries.pop(cmd_id, None)
-        self._metadata_requested_tables.add(table_id)
-        try:
-            await self.async_send_command(cmd)
-            _LOGGER.info("Sent GetDevicesMetadata for table %d (cmdId=%d)", table_id, cmd_id)
-        except Exception as exc:
-            self._pending_metadata_cmdids.pop(cmd_id, None)
-            self._pending_metadata_entries.pop(cmd_id, None)
-            _LOGGER.warning("Failed to send metadata request: %s", exc)
+        await self._myrvlink_runtime.send_metadata_request(table_id)
 
     async def _retry_metadata_after_rejection(self, table_id: int) -> None:
         """Retry GetDevicesMetadata 10s after a rejection.
@@ -1307,21 +1536,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Mirrors official app behavior of continued retry attempts as long as the
         tracker is active; do not permanently give up after a fixed retry count.
         """
-        await asyncio.sleep(10.0)
-        if not self._connected:
-            return
-        if table_id in self._metadata_loaded_tables:
-            return
-        _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
-        self._metadata_requested_tables.discard(table_id)
-        if table_id not in self._get_devices_loaded_tables:
-            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-            _LOGGER.debug(
-                "Retry for metadata table %d deferred — waiting for GetDevices completion",
-                table_id,
-            )
-            return
-        await self._send_metadata_request(table_id)
+        await self._myrvlink_runtime.retry_metadata_after_rejection(table_id)
 
     async def _send_initial_get_devices(self) -> None:
         """Send GetDevices at T+500ms to wake the gateway before metadata is requested.
@@ -1335,38 +1550,51 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         GatewayInfo handler will call _do_send_initial_get_devices() directly
         as a fallback when it stores the first GatewayInfo event.
         """
-        await asyncio.sleep(0.5)
-        await self._do_send_initial_get_devices()
+        await self._myrvlink_runtime.send_initial_get_devices()
 
     async def _do_send_initial_get_devices(self) -> None:
         """Send the initial GetDevices command if not already sent.
 
         Idempotent — skipped if already sent or if connection/auth state is invalid.
         """
-        if self._initial_get_devices_sent:
-            return
-        if not self._connected or not self._authenticated:
-            return
-        if self.gateway_info is None:
-            return
-        try:
-            cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
-            cmd_id = int.from_bytes(cmd[0:2], "little")
-            self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
-            if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
-                self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
-            self._cmd_correlation_stats["pending_get_devices_peak"] = max(
-                self._cmd_correlation_stats["pending_get_devices_peak"],
-                len(self._pending_get_devices_cmdids),
-            )
-            await self.async_send_command(cmd)
-            self._initial_get_devices_sent = True
-            _LOGGER.debug(
-                "Initial GetDevices sent for table %d (cmdId=%d)",
-                self.gateway_info.table_id, cmd_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Initial GetDevices failed: %s", exc)
+        await self._myrvlink_runtime.do_send_initial_get_devices()
+
+    def _select_get_devices_table_id(self) -> int | None:
+        """Pick a table id for GetDevices when gateway info may be unavailable.
+
+        GatewayInfo table id is preferred. On Ethernet bridges that never emit
+        GatewayInfo, fall back to the most frequently observed non-zero table id
+        from live device state keys (TT:DD).
+        """
+        if self.gateway_info is not None and self.gateway_info.table_id != 0:
+            return self.gateway_info.table_id
+
+        table_counts: dict[int, int] = {}
+        for status_dict in (
+            self.relays,
+            self.dimmable_lights,
+            self.rgb_lights,
+            self.covers,
+            self.hvac_zones,
+            self.tanks,
+            self.device_online,
+            self.device_locks,
+            self.generators,
+            self.hour_meters,
+        ):
+            for key in status_dict:
+                try:
+                    table_id = int(key.split(":", 1)[0], 16)
+                except (ValueError, IndexError):
+                    continue
+                if table_id == 0:
+                    continue
+                table_counts[table_id] = table_counts.get(table_id, 0) + 1
+
+        if not table_counts:
+            return None
+
+        return max(table_counts, key=lambda tid: table_counts[tid])
 
     async def _request_metadata_after_delay(self, table_id: int) -> None:
         """Wait 1500ms then request metadata.
@@ -1375,19 +1603,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         metadata at T+1500ms), giving the gateway time to process the device-list
         request before we ask for metadata.
         """
-        await asyncio.sleep(1.5)
-        if table_id in self._metadata_loaded_tables:
-            return
-        if table_id in self._metadata_requested_tables:
-            return
-        if table_id not in self._get_devices_loaded_tables:
-            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-            _LOGGER.debug(
-                "Metadata request deferred for table %d — waiting for GetDevices completion",
-                table_id,
-            )
-            return
-        await self._send_metadata_request(table_id)
+        await self._myrvlink_runtime.request_metadata_after_delay(table_id)
 
     def _ensure_metadata_for_table(self, table_id: int) -> None:
         """Request metadata for an observed table_id if not yet requested/loaded/rejected.
@@ -1396,22 +1612,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         triggers a metadata request for that table if we haven't already loaded or
         requested it.  This mirrors Android's ensureMetadataRequestedForTable().
         """
-        if table_id == 0:
-            return
-        if (
-            table_id in self._metadata_loaded_tables
-            or table_id in self._metadata_requested_tables
-        ):
-            return
-        if table_id not in self._get_devices_loaded_tables:
-            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-            _LOGGER.debug(
-                "Observed table_id=%d but delaying metadata until GetDevices completes",
-                table_id,
-            )
-            return
-        _LOGGER.info("Requesting metadata for observed table_id=%d", table_id)
-        self.hass.async_create_task(self._send_metadata_request(table_id))
+        self._myrvlink_runtime.ensure_metadata_for_table(table_id)
 
     # ------------------------------------------------------------------
     # Heartbeat keepalive (GetDevices every 5 seconds)
@@ -1420,10 +1621,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _start_heartbeat(self) -> None:
         """Start the heartbeat loop after authentication."""
         self._stop_heartbeat()
+        interval = (
+            _ETHERNET_HEARTBEAT_INTERVAL_S
+            if self.is_ethernet_gateway
+            else HEARTBEAT_INTERVAL
+        )
         self._heartbeat_task = self.hass.async_create_background_task(
             self._heartbeat_loop(), name="ha_onecontrol_heartbeat"
         )
-        _LOGGER.info("Heartbeat started (every %.0fs)", HEARTBEAT_INTERVAL)
+        _LOGGER.info("Heartbeat started (every %.1fs)", interval)
 
     def _stop_heartbeat(self) -> None:
         """Cancel the heartbeat loop."""
@@ -1431,6 +1637,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
             _LOGGER.debug("Heartbeat stopped")
+
+    async def _force_ethernet_reconnect(self, reason: str) -> None:
+        """Close Ethernet transport and trigger reconnect handling once."""
+        runtime = getattr(self, "_ids_runtime", None)
+        if runtime is not None:
+            await runtime.force_reconnect(reason)
+            return
+
+        if not self.is_ethernet_gateway or not self._connected:
+            return
+        _LOGGER.debug("Forcing Ethernet reconnect (%s)", reason)
+        await self._close_ethernet_transport()
+        if self._connected:
+            self._handle_transport_disconnect("ethernet", reason)
 
     async def _heartbeat_loop(self) -> None:
         """Send GetDevices periodically to keep BLE connection alive.
@@ -1440,11 +1660,42 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Reference: Android HEARTBEAT_INTERVAL_MS = 5000L
         """
+        interval = (
+            _ETHERNET_HEARTBEAT_INTERVAL_S
+            if self.is_ethernet_gateway
+            else HEARTBEAT_INTERVAL
+        )
         try:
             while self._connected and self._authenticated:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
-                if not self._connected or not self.gateway_info:
+                await asyncio.sleep(interval)
+                if not self._connected:
                     break
+
+                if self.is_ethernet_gateway and not self.gateway_info:
+                    runtime = getattr(self, "_ids_runtime", None)
+                    try:
+                        if runtime is not None:
+                            await runtime.heartbeat_pre_gateway_cycle(
+                                _ETHERNET_TRANSPORT_KEEPALIVE_INTERVAL_S
+                            )
+                        else:
+                            await self._send_ethernet_transport_keepalive()
+                            if getattr(self, "_pending_get_devices_cmdids", {}):
+                                continue
+                            table_id = self._select_get_devices_table_id()
+                            if table_id is not None:
+                                cmd = self._cmd.build_get_devices(table_id)
+                                cmd_id = int.from_bytes(cmd[0:2], "little")
+                                self._record_pending_get_devices_cmd(cmd_id, table_id)
+                                await self.async_send_command(cmd)
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception("Ethernet transport keepalive error")
+                        await self._force_ethernet_reconnect("transport keepalive failed")
+                        break
+                    continue
+
+                if not self.gateway_info:
+                    continue
 
                 # Stale connection detection
                 if (
@@ -1452,10 +1703,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     and (time.monotonic() - self._last_event_time) > STALE_CONNECTION_TIMEOUT
                 ):
                     _LOGGER.warning(
-                        "No events for %.0fs — connection stale, forcing reconnect",
+                        "No events for %.0fs - connection stale, forcing reconnect",
                         STALE_CONNECTION_TIMEOUT,
                     )
-                    if self._client:
+                    if self.is_ethernet_gateway:
+                        await self._force_ethernet_reconnect("stale heartbeat")
+                    elif self._client:
                         try:
                             await self._client.disconnect()
                         except Exception:
@@ -1463,21 +1716,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     break
 
                 try:
+                    self._prune_pending_command_state()
+                    if self.is_ethernet_gateway and getattr(self, "_pending_get_devices_cmdids", {}):
+                        continue
                     cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
                     cmd_id = int.from_bytes(cmd[0:2], "little")
-                    self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
-                    if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
-                        self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
-                    self._cmd_correlation_stats["pending_get_devices_peak"] = max(
-                        self._cmd_correlation_stats["pending_get_devices_peak"],
-                        len(self._pending_get_devices_cmdids),
-                    )
+                    self._record_pending_get_devices_cmd(cmd_id, self.gateway_info.table_id)
                     await self.async_send_command(cmd)
                 except BleakError as exc:
                     _LOGGER.warning("Heartbeat BLE write failed: %s", exc)
+                    if self.is_ethernet_gateway:
+                        await self._force_ethernet_reconnect("heartbeat write failed")
                     break
                 except Exception:  # noqa: BLE001
                     _LOGGER.exception("Heartbeat error")
+                    if self.is_ethernet_gateway:
+                        await self._force_ethernet_reconnect("heartbeat exception")
                     break
         except asyncio.CancelledError:
             pass
@@ -1503,180 +1757,38 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Track data freshness
         self._last_event_time = time.monotonic()
+        self._prune_pending_command_state()
 
         event_type = frame[0]
+        family = self._classify_frame_family(frame)
+        self._frame_family_stats[family] = self._frame_family_stats.get(family, 0) + 1
 
-        # Detect metadata error/completion responses before full parse.
-        # responseType byte 3: 0x01=SuccessMulti, 0x81=SuccessComplete, 0x02/0x82=Fail
-        # Reference: METADATA_RETRIEVAL.md § Response Format; MyRvLinkCommandGetDevicesMetadata.cs
-        if event_type == 0x02 and len(frame) >= 4:
-            response_type = frame[3] & 0xFF
-            if response_type == 0x81:
-                # SuccessComplete: final frame carrying DeviceMetadataTableCrc (bytes 4–7 LE)
-                # and total device count (byte 8). Validate CRC against GatewayInformation.
-                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
-                completed_get_devices_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
-                if completed_get_devices_table is not None:
-                    self._cmd_correlation_stats["get_devices_completed"] += 1
-                    self._get_devices_loaded_tables.add(completed_get_devices_table)
-                    _LOGGER.debug(
-                        "GetDevices completion frame (cmdId=%d table=%d, loaded_tables=%d)",
-                        cmd_id,
-                        completed_get_devices_table,
-                        len(self._get_devices_loaded_tables),
-                    )
-                    if (
-                        completed_get_devices_table not in self._metadata_loaded_tables
-                        and completed_get_devices_table not in self._metadata_requested_tables
-                    ):
-                        _LOGGER.debug(
-                            "Scheduling metadata request after GetDevices completion for table %d",
-                            completed_get_devices_table,
-                        )
-                        self.hass.async_create_task(
-                            self._send_metadata_request(completed_get_devices_table)
-                        )
-                    return
-                completed_table = self._pending_metadata_cmdids.pop(cmd_id, None)
-                if completed_table is not None and len(frame) >= 8:
-                    # CRC is big-endian per MyRvLinkCommandGetDevicesMetadataResponseCompleted.cs
-                    # (GetValueUInt32 defaults to Endian.Big in ArrayExtension.cs)
-                    response_crc = int.from_bytes(frame[4:8], "big")
-                    response_count = frame[8] & 0xFF if len(frame) >= 9 else None
-                    staged_entries = self._pending_metadata_entries.pop(cmd_id, {})
-                    staged_count = len(staged_entries)
-                    expected_crc = (
-                        self.gateway_info.device_metadata_table_crc
-                        if self.gateway_info is not None
-                        else 0
-                    )
-                    if expected_crc != 0 and response_crc != expected_crc:
-                        self._cmd_correlation_stats["metadata_commit_crc_mismatch"] += 1
-                        _LOGGER.warning(
-                            "Metadata CRC mismatch for table %d: "
-                            "response=0x%08x, expected=0x%08x — discarding",
-                            completed_table,
-                            response_crc,
-                            expected_crc,
-                        )
-                        self._metadata_loaded_tables.discard(completed_table)
-                        self._metadata_requested_tables.discard(completed_table)
-                        self._last_metadata_crc = None
-                    elif response_count is not None and response_count != staged_count:
-                        self._cmd_correlation_stats["metadata_commit_count_mismatch"] += 1
-                        _LOGGER.warning(
-                            "Metadata count mismatch for table %d: completed=%d staged=%d — discarding",
-                            completed_table,
-                            response_count,
-                            staged_count,
-                        )
-                        self._metadata_loaded_tables.discard(completed_table)
-                        self._metadata_requested_tables.discard(completed_table)
-                        self._last_metadata_crc = None
-                    else:
-                        for meta in staged_entries.values():
-                            self._process_metadata(meta)
-                        self._metadata_loaded_tables.add(completed_table)
-                        self._last_metadata_crc = response_crc
-                        self._cmd_correlation_stats["metadata_commit_success"] += 1
-                        _LOGGER.debug(
-                            "Metadata completion OK for table %d (CRC=0x%08x, entries=%d)",
-                            completed_table,
-                            response_crc,
-                            staged_count,
-                        )
-                return
-            if response_type == 0x82:
-                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
-                rejected_table = self._pending_metadata_cmdids.pop(cmd_id, None)
-                self._pending_metadata_entries.pop(cmd_id, None)
-                if rejected_table is not None:
-                    error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
-                    if error_code == 0x0F:
-                        retry_count = self._metadata_retry_counts.get(rejected_table, 0) + 1
-                        self._metadata_retry_counts[rejected_table] = retry_count
-                        self._cmd_correlation_stats["metadata_retry_scheduled"] += 1
-                        _LOGGER.warning(
-                            "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
-                            " — scheduling retry #%d in 10s",
-                            rejected_table,
-                            retry_count,
-                        )
-                        self.hass.async_create_task(
-                            self._retry_metadata_after_rejection(rejected_table)
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "Metadata request failed for table_id=%d (errorCode=0x%02x)",
-                            rejected_table,
-                            error_code if error_code >= 0 else 0,
-                        )
-                else:
-                    # Check if this is a GetDevices rejection instead of metadata.
-                    gd_table = self._pending_get_devices_cmdids.pop(cmd_id, None)
-                    if gd_table is not None:
-                        self._cmd_correlation_stats["get_devices_rejected"] += 1
-                        self._get_devices_loaded_tables.discard(gd_table)
-                        error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
-                        _LOGGER.warning(
-                            "GetDevices rejected by gateway for table_id=%d "
-                            "(cmdId=%d errorCode=0x%02x) — metadata requests will wait",
-                            gd_table, cmd_id,
-                            error_code if error_code >= 0 else 0,
-                        )
-                    else:
-                        self._cmd_correlation_stats["command_error_unknown"] += 1
-                        count = self._unknown_command_counts.get(cmd_id, 0) + 1
-                        self._unknown_command_counts[cmd_id] = count
-                        if count <= 3 or count in (10, 50, 100) or count % 500 == 0:
-                            _LOGGER.debug(
-                                "Command error response for unknown cmdId=%d (count=%d)",
-                                cmd_id,
-                                count,
-                            )
-                return
-            # SuccessMulti (0x01): contains actual device/metadata entries.
-            # GetDevices and GetDevicesMetadata both use event_type=0x02 with
-            # response_type=0x01; the ONLY distinguisher is the cmdId in bytes 1-2.
-            # Without this gate, GetDevices device-row frames (payloadSize=10) are
-            # incorrectly passed to parse_metadata_response and silently skipped.
-            if response_type == 0x01 and len(frame) >= 3:
-                cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
-                if cmd_id not in self._pending_metadata_cmdids:
-                    if cmd_id in self._pending_get_devices_cmdids:
-                        self._cmd_correlation_stats[
-                            "metadata_success_multi_discarded_get_devices"
-                        ] += 1
-                        _LOGGER.debug(
-                            "GetDevices response frame (cmdId=%d) — discarding "
-                            "(not a metadata request)", cmd_id
-                        )
-                    else:
-                        self._cmd_correlation_stats[
-                            "metadata_success_multi_discarded_unknown"
-                        ] += 1
-                        count = self._unknown_command_counts.get(cmd_id, 0) + 1
-                        self._unknown_command_counts[cmd_id] = count
-                        if count <= 3 or count in (10, 50, 100) or count % 500 == 0:
-                            _LOGGER.debug(
-                                "Command response frame for unknown cmdId=%d — discarding (count=%d)",
-                                cmd_id,
-                                count,
-                            )
-                    return
-                self._cmd_correlation_stats["metadata_success_multi_accepted"] += 1
-                staged = self._pending_metadata_entries.setdefault(cmd_id, {})
-                added = 0
-                for meta in parse_metadata_response(frame):
-                    key = _device_key(meta.table_id, meta.device_id)
-                    if key not in staged:
-                        added += 1
-                    staged[key] = meta
-                if added:
-                    self._cmd_correlation_stats["metadata_entries_staged"] += added
-                return
+        runtime = getattr(self, "_ids_runtime", None)
+        if self.is_ethernet_gateway and runtime is not None and runtime.handle_frame(frame):
+            return
 
-        event = parse_event(frame)
+        myrv_runtime = getattr(self, "_myrvlink_runtime", None)
+        if (
+            not self.is_ethernet_gateway
+            and myrv_runtime is not None
+            and myrv_runtime.handle_command_frame(frame)
+        ):
+            return
+
+        try:
+            event = parse_event(frame)
+        except Exception as exc:  # noqa: BLE001
+            self._cmd_correlation_stats["frame_parse_errors"] += 1
+            count = self._cmd_correlation_stats["frame_parse_errors"]
+            if count <= 3 or count in (10, 50, 100) or count % 500 == 0:
+                _LOGGER.warning(
+                    "Frame parse failed (event=0x%02X count=%d): %s frame=%s",
+                    event_type,
+                    count,
+                    exc,
+                    frame.hex(),
+                )
+            return
         _LOGGER.debug(
             "Event 0x%02X (%d bytes): %s",
             event_type,
@@ -1686,73 +1798,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── Update accumulated state ──────────────────────────────────
         if isinstance(event, GatewayInformation):
-            _LOGGER.debug(
-                "GatewayInfo: table_id=%d, devices=%d, "
-                "table_crc=0x%08x, metadata_crc=0x%08x",
-                event.table_id,
-                event.device_count,
-                event.device_table_crc,
-                event.device_metadata_table_crc,
-            )
-
-            # CRC-gated metadata logic (mirrors official app DeviceMetadataTracker):
-            # If the gateway reports the same DeviceMetadataTableCrc we last loaded,
-            # the metadata in _metadata_raw is still valid — restore tracking state
-            # and skip the BLE request entirely.
-            # If the CRC has changed, invalidate cached metadata for this table so
-            # a fresh request is triggered (e.g. after a gateway firmware update).
-            crc = event.device_metadata_table_crc
-            if crc != 0 and crc == self._last_metadata_crc:
-                self._metadata_loaded_tables.add(event.table_id)
-                _LOGGER.debug(
-                    "Metadata CRC unchanged (0x%08x), skipping re-request for table %d",
-                    crc,
-                    event.table_id,
-                )
-            elif (
-                self._last_metadata_crc is not None
-                and crc != self._last_metadata_crc
-                and event.table_id in self._metadata_loaded_tables
-            ):
-                _LOGGER.info(
-                    "Metadata CRC changed (0x%08x → 0x%08x), invalidating table %d",
-                    self._last_metadata_crc,
-                    crc,
-                    event.table_id,
-                )
-                self._last_metadata_crc = None
-                prefix = f"{event.table_id:02x}:"
-                for k in list(self._metadata_raw):
-                    if k.startswith(prefix):
-                        del self._metadata_raw[k]
-                        self.device_names.pop(k, None)
-                self._metadata_requested_tables.discard(event.table_id)
-                self._metadata_loaded_tables.discard(event.table_id)
-                self._metadata_rejected_tables.discard(event.table_id)
-
-            self.gateway_info = event
-
-            # Belt-and-suspenders: if GatewayInfo arrived after the T+0.5s
-            # window (so _send_initial_get_devices bailed), send GetDevices now
-            # so it still precedes the metadata request below.
-            if not self._initial_get_devices_sent:
-                self.hass.async_create_task(self._do_send_initial_get_devices())
-
-            # Schedule metadata request if not already handled by CRC gate above.
-            if (
-                event.table_id not in self._metadata_loaded_tables
-                and event.table_id not in self._metadata_requested_tables
-            ):
-                if event.table_id in self._get_devices_loaded_tables:
-                    self.hass.async_create_task(
-                        self._request_metadata_after_delay(event.table_id)
-                    )
-                else:
-                    self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-                    _LOGGER.debug(
-                        "GatewayInfo table %d waiting for GetDevices completion before metadata request",
-                        event.table_id,
-                    )
+            self._myrvlink_runtime.handle_gateway_information(event)
 
         elif isinstance(event, RvStatus):
             self.rv_status = event
@@ -1765,7 +1811,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, RelayStatus):
             key = _device_key(event.table_id, event.device_id)
             self.relays[key] = event
-            self._ensure_metadata_for_table(event.table_id)
             # Fire HA event for DTC faults (only on change, gas appliances only)
             # Android behaviour: only publish DTC for devices with "gas" in name
             prev_dtc = self._last_dtc_codes.get(key, 0)
@@ -1801,17 +1846,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.dimmable_lights[key] = event
             if event.brightness > 0:
                 self._last_known_dimmable_brightness[key] = event.brightness
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RgbLight):
             key = _device_key(event.table_id, event.device_id)
             self.rgb_lights[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, CoverStatus):
             key = _device_key(event.table_id, event.device_id)
             self.covers[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, list):
             # Multi-item events: HvacZone list, TankLevel list, DeviceMetadata list
@@ -1821,14 +1863,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 elif isinstance(item, TankLevel):
                     key = _device_key(item.table_id, item.device_id)
                     self.tanks[key] = item
-                    self._ensure_metadata_for_table(item.table_id)
-                elif isinstance(item, DeviceMetadata):
-                    self._process_metadata(item)
 
         elif isinstance(event, TankLevel):
             key = _device_key(event.table_id, event.device_id)
             self.tanks[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HvacZone):
             self._handle_hvac_zone(event)
@@ -1836,7 +1874,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, DeviceOnline):
             key = _device_key(event.table_id, event.device_id)
             self.device_online[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, SystemLockout):
             self.system_lockout_level = event.lockout_level
@@ -1848,50 +1885,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif isinstance(event, DeviceLock):
             key = _device_key(event.table_id, event.device_id)
             self.device_locks[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, GeneratorStatus):
             key = _device_key(event.table_id, event.device_id)
             self.generators[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HourMeter):
             key = _device_key(event.table_id, event.device_id)
             self.hour_meters[key] = event
-            self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RealTimeClock):
             self.rtc = event
 
-        # ── Notify entity callbacks ───────────────────────────────────
-        for cb in self._event_callbacks:
-            try:
-                cb(event)
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Error in event callback")
-
-        # ── Trigger HA state update ───────────────────────────────────
-        self.async_set_updated_data(self._build_data())
+        self._myrvlink_runtime.handle_metadata_for_event(event)
+        self._dispatch_event_update(event)
 
     def _process_metadata(self, meta: DeviceMetadata) -> None:
         """Store metadata and resolve friendly name."""
-        key = _device_key(meta.table_id, meta.device_id)
-        self._metadata_raw[key] = meta
-        name = get_friendly_name(meta.function_name, meta.function_instance)
-        self.device_names[key] = name
-        self._metadata_loaded_tables.add(meta.table_id)
-        # Record the CRC for the gateway's primary table so reconnects can skip
-        # re-requesting metadata when the CRC hasn't changed.
-        if (
-            self.gateway_info is not None
-            and meta.table_id == self.gateway_info.table_id
-            and self.gateway_info.device_metadata_table_crc != 0
-        ):
-            self._last_metadata_crc = self.gateway_info.device_metadata_table_crc
-        _LOGGER.info(
-            "Metadata: %s → func=%d inst=%d → %s",
-            key.upper(), meta.function_name, meta.function_instance, name,
-        )
+        self._myrvlink_runtime.process_metadata(meta)
 
     def _build_data(self) -> dict[str, Any]:
         """Build the coordinator data dict consumed by entities."""
@@ -1918,25 +1929,29 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _on_disconnect(self, client: BleakClient) -> None:
         """Handle unexpected BLE disconnect — schedule reconnect with backoff."""
-        self._handle_transport_disconnect("ble")
+        self._handle_transport_disconnect("ble", "ble disconnected callback")
 
-    def _handle_transport_disconnect(self, transport: str) -> None:
+    @callback
+    def _on_hass_stop(self, event: Any) -> None:
+        """Stop non-critical background tasks during Home Assistant shutdown."""
+        self._cancel_reconnect()
+        self._stop_heartbeat()
+        if self._ethernet_reader_task and not self._ethernet_reader_task.done():
+            self._ethernet_reader_task.cancel()
+            self._ethernet_reader_task = None
+        self._ids_runtime.cleanup_on_disconnect()
+
+    def _handle_transport_disconnect(self, transport: str, reason: str | None = None) -> None:
         """Handle unexpected transport disconnect and schedule reconnect."""
+        reason_text = reason or "unknown"
+        self._disconnect_count += 1
+        self._last_disconnect_reason = f"{transport}:{reason_text}"
         _LOGGER.warning("OneControl %s disconnected (instance=%s)", self.address, self._instance_tag)
         self._stop_heartbeat()
         self._connected = False
         self._authenticated = False
         self._decoder.reset()
-        self._metadata_requested_tables.clear()
-        self._metadata_loaded_tables.clear()
-        self._metadata_rejected_tables.clear()
-        self._metadata_retry_counts.clear()
-        self._pending_metadata_cmdids.clear()
-        self._pending_metadata_entries.clear()
-        self._pending_get_devices_cmdids.clear()
-        self._get_devices_loaded_tables.clear()
-        self._unknown_command_counts.clear()
-        self._initial_get_devices_sent = False
+        self._myrvlink_runtime.reset_protocol_tracking_state()
         self._has_can_write = False
         self._pin_dbus_succeeded = False
         self._push_button_dbus_ok = False
@@ -1948,17 +1963,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hass.async_create_task(ctx.cleanup())
 
         if transport == "ethernet":
-            if self._eth_writer is not None:
-                self._eth_writer.close()
-            self._eth_reader = None
-            self._eth_writer = None
-            if self._ethernet_reader_task and not self._ethernet_reader_task.done():
-                self._ethernet_reader_task.cancel()
-            self._ethernet_reader_task = None
+            self._ids_runtime.cleanup_on_disconnect()
 
         self.async_set_updated_data(self._build_data())
 
         # Schedule automatic reconnection with exponential backoff
+        if getattr(self.hass, "is_stopping", False):
+            return
         self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
@@ -1969,6 +1980,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         prevents multiple concurrent reconnect coroutines from racing each other
         into BlueZ's "InProgress" error state.
         """
+        if getattr(self.hass, "is_stopping", False):
+            _LOGGER.debug("Skipping reconnect scheduling because Home Assistant is stopping")
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
 
@@ -1996,6 +2010,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Skipping stale reconnect task (gen=%d current=%d instance=%s)",
                     generation, self._reconnect_generation, self._instance_tag,
                 )
+                return
+            if getattr(self.hass, "is_stopping", False):
                 return
             if self._connected:
                 return  # Already reconnected by another path
@@ -2040,7 +2056,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Called by the coordinator on its polling interval (if set)."""
-        if not self._connected:
+        if not self._connected and not getattr(self.hass, "is_stopping", False):
             try:
                 await self.async_connect()
             except BleakError as exc:

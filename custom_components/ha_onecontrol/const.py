@@ -161,6 +161,10 @@ CONF_BONDED_SOURCE = "bonded_source"
 CONF_CONNECTION_TYPE = "connection_type"
 CONF_ETH_HOST = "eth_host"
 CONF_ETH_PORT = "eth_port"
+CONF_NAMING_MANIFEST_PATH = "naming_manifest_path"
+CONF_NAMING_SNAPSHOT_PATH = "naming_snapshot_path"
+CONF_NAMING_MANIFEST_JSON = "naming_manifest_json"
+CONF_NAMING_SNAPSHOT_JSON = "naming_snapshot_json"
 
 DEFAULT_ETH_HOST = "192.168.1.1"
 DEFAULT_ETH_PORT = 6969
