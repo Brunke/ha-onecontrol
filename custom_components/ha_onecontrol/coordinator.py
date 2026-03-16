@@ -101,6 +101,11 @@ from .protocol.tea import calculate_step1_key, calculate_step2_key
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_PENDING_GET_DEVICES_CMDIDS = 128
+# After this many consecutive GetDevices rejections for a table, bypass the
+# get-devices gate and attempt GetDevicesMetadata directly.  This prevents a
+# permanently-blocking state when the gateway refuses the 0x01 wake command
+# (observed after 12V power cycles with a fresh BLE bond).
+_GET_DEVICES_REJECTION_BYPASS_COUNT = 10
 
 
 def _device_key(table_id: int, device_id: int) -> str:
@@ -172,6 +177,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_metadata_entries: dict[int, dict[str, DeviceMetadata]] = {}
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._get_devices_loaded_tables: set[int] = set()
+        self._get_devices_reject_counts: dict[int, int] = {}  # table_id → consecutive rejection count
         self._unknown_command_counts: dict[int, int] = {}
         self._cmd_correlation_stats: dict[str, int] = {
             "metadata_success_multi_accepted": 0,
@@ -1534,12 +1540,30 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._cmd_correlation_stats["get_devices_rejected"] += 1
                         self._get_devices_loaded_tables.discard(gd_table)
                         error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
-                        _LOGGER.warning(
-                            "GetDevices rejected by gateway for table_id=%d "
-                            "(cmdId=%d errorCode=0x%02x) — metadata requests will wait",
-                            gd_table, cmd_id,
-                            error_code if error_code >= 0 else 0,
-                        )
+                        reject_count = self._get_devices_reject_counts.get(gd_table, 0) + 1
+                        self._get_devices_reject_counts[gd_table] = reject_count
+                        if reject_count >= _GET_DEVICES_REJECTION_BYPASS_COUNT:
+                            _LOGGER.warning(
+                                "GetDevices rejected %d times for table_id=%d "
+                                "(cmdId=%d errorCode=0x%02x) — bypassing gate, attempting metadata directly",
+                                reject_count, gd_table, cmd_id,
+                                error_code if error_code >= 0 else 0,
+                            )
+                            self._get_devices_loaded_tables.add(gd_table)
+                            if (
+                                gd_table not in self._metadata_loaded_tables
+                                and gd_table not in self._metadata_requested_tables
+                            ):
+                                self.hass.async_create_task(
+                                    self._send_metadata_request(gd_table)
+                                )
+                        else:
+                            _LOGGER.warning(
+                                "GetDevices rejected by gateway for table_id=%d "
+                                "(cmdId=%d errorCode=0x%02x) — metadata requests will wait",
+                                gd_table, cmd_id,
+                                error_code if error_code >= 0 else 0,
+                            )
                     else:
                         self._cmd_correlation_stats["command_error_unknown"] += 1
                         count = self._unknown_command_counts.get(cmd_id, 0) + 1
@@ -1846,6 +1870,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
         self._get_devices_loaded_tables.clear()
+        self._get_devices_reject_counts.clear()
         self._unknown_command_counts.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
