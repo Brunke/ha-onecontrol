@@ -106,6 +106,9 @@ _MAX_PENDING_GET_DEVICES_CMDIDS = 128
 # permanently-blocking state when the gateway refuses the 0x01 wake command
 # (observed after 12V power cycles with a fresh BLE bond).
 _GET_DEVICES_REJECTION_BYPASS_COUNT = 10
+_STARTUP_BOOTSTRAP_WAIT_SECONDS = 8.0
+_STARTUP_BOOTSTRAP_BACKOFF_SECONDS = 1.0
+_STARTUP_BOOTSTRAP_MAX_ATTEMPTS = 6
 
 
 def _device_key(table_id: int, device_id: int) -> str:
@@ -178,6 +181,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._get_devices_loaded_tables: set[int] = set()
         self._get_devices_reject_counts: dict[int, int] = {}  # table_id → consecutive rejection count
+        self._bootstrap_waiters: dict[tuple[str, int], asyncio.Future[str]] = {}
+        self._startup_bootstrap_task: asyncio.Task | None = None
+        self._startup_bootstrap_table_id: int | None = None
         self._unknown_command_counts: dict[int, int] = {}
         self._cmd_correlation_stats: dict[str, int] = {
             "metadata_success_multi_accepted": 0,
@@ -381,6 +387,151 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         if is_setpoint_change:
             self._schedule_setpoint_retry(key)
+
+    def _is_startup_bootstrap_active(self, table_id: int | None = None) -> bool:
+        """Return True while the serialized startup query flow is active."""
+        if self._startup_bootstrap_task is None or self._startup_bootstrap_task.done():
+            return False
+        if table_id is None:
+            return True
+        return self._startup_bootstrap_table_id == table_id
+
+    def _resolve_bootstrap_waiter(self, kind: str, table_id: int, result: str) -> None:
+        """Resolve a bootstrap waiter for a specific query class/table pair."""
+        waiter = self._bootstrap_waiters.pop((kind, table_id), None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(result)
+
+    def _cancel_startup_bootstrap(self) -> None:
+        """Cancel any active startup bootstrap and fail outstanding waiters."""
+        if self._startup_bootstrap_task and not self._startup_bootstrap_task.done():
+            self._startup_bootstrap_task.cancel()
+        self._startup_bootstrap_task = None
+        self._startup_bootstrap_table_id = None
+        for waiter in self._bootstrap_waiters.values():
+            if not waiter.done():
+                waiter.cancel()
+        self._bootstrap_waiters.clear()
+
+    def _ensure_startup_bootstrap(self, table_id: int) -> None:
+        """Start or reuse the serialized startup bootstrap for a table."""
+        if table_id == 0 or not self._connected or not self._authenticated:
+            return
+        if table_id in self._metadata_loaded_tables:
+            self._start_heartbeat()
+            return
+        if self._is_startup_bootstrap_active(table_id):
+            return
+        if self._startup_bootstrap_task and not self._startup_bootstrap_task.done():
+            self._cancel_startup_bootstrap()
+        self._startup_bootstrap_table_id = table_id
+        self._startup_bootstrap_task = self.hass.async_create_task(
+            self._bootstrap_table_queries(table_id)
+        )
+
+    async def _send_get_devices_request(self, table_id: int) -> int:
+        """Send GetDevices for a specific table and track the pending cmdId."""
+        cmd = self._cmd.build_get_devices(table_id)
+        cmd_id = int.from_bytes(cmd[0:2], "little")
+        self._pending_get_devices_cmdids[cmd_id] = table_id
+        if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
+            self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
+        self._cmd_correlation_stats["pending_get_devices_peak"] = max(
+            self._cmd_correlation_stats["pending_get_devices_peak"],
+            len(self._pending_get_devices_cmdids),
+        )
+        await self.async_send_command(cmd)
+        return cmd_id
+
+    async def _send_query_and_wait(self, kind: str, table_id: int) -> str:
+        """Send a bootstrap query and wait for its completion or rejection."""
+        waiter_key = (kind, table_id)
+        existing_waiter = self._bootstrap_waiters.get(waiter_key)
+        if existing_waiter is not None and not existing_waiter.done():
+            return await asyncio.wait_for(
+                asyncio.shield(existing_waiter),
+                timeout=_STARTUP_BOOTSTRAP_WAIT_SECONDS,
+            )
+
+        waiter = asyncio.get_running_loop().create_future()
+        self._bootstrap_waiters[waiter_key] = waiter
+        try:
+            if kind == "get_devices":
+                cmd_id = await self._send_get_devices_request(table_id)
+                self._initial_get_devices_sent = True
+                _LOGGER.debug(
+                    "Startup GetDevices sent for table %d (cmdId=%d)",
+                    table_id,
+                    cmd_id,
+                )
+            else:
+                await self._send_metadata_request(table_id)
+            return await asyncio.wait_for(
+                asyncio.shield(waiter),
+                timeout=_STARTUP_BOOTSTRAP_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self._bootstrap_waiters.pop(waiter_key, None)
+            return "timeout"
+        except Exception:
+            self._bootstrap_waiters.pop(waiter_key, None)
+            raise
+
+    async def _bootstrap_table_queries(self, table_id: int) -> None:
+        """Serialize startup GetDevices/metadata queries before heartbeat."""
+        try:
+            if table_id in self._metadata_loaded_tables:
+                self._start_heartbeat()
+                return
+
+            for attempt in range(1, _STARTUP_BOOTSTRAP_MAX_ATTEMPTS + 1):
+                if not self._connected or not self._authenticated:
+                    return
+                if self.gateway_info is None or self.gateway_info.table_id != table_id:
+                    return
+                if table_id in self._metadata_loaded_tables:
+                    break
+
+                if table_id not in self._get_devices_loaded_tables:
+                    result = await self._send_query_and_wait("get_devices", table_id)
+                    if result != "completed":
+                        _LOGGER.debug(
+                            "Startup GetDevices for table %d attempt %d/%d ended with %s",
+                            table_id,
+                            attempt,
+                            _STARTUP_BOOTSTRAP_MAX_ATTEMPTS,
+                            result,
+                        )
+                        await asyncio.sleep(_STARTUP_BOOTSTRAP_BACKOFF_SECONDS)
+                        continue
+
+                if table_id in self._metadata_loaded_tables:
+                    break
+
+                result = await self._send_query_and_wait("metadata", table_id)
+                if result == "completed":
+                    break
+
+                _LOGGER.debug(
+                    "Startup metadata for table %d attempt %d/%d ended with %s",
+                    table_id,
+                    attempt,
+                    _STARTUP_BOOTSTRAP_MAX_ATTEMPTS,
+                    result,
+                )
+                self._metadata_requested_tables.discard(table_id)
+                await asyncio.sleep(_STARTUP_BOOTSTRAP_BACKOFF_SECONDS)
+
+            if self._connected and self._authenticated:
+                self._start_heartbeat()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._startup_bootstrap_table_id == table_id:
+                self._startup_bootstrap_task = None
+                self._startup_bootstrap_table_id = None
+            self._resolve_bootstrap_waiter("get_devices", table_id, "canceled")
+            self._resolve_bootstrap_waiter("metadata", table_id, "canceled")
 
     # ------------------------------------------------------------------
     # HVAC capability tracking, pending guard, and setpoint retry
@@ -628,6 +779,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_disconnect(self) -> None:
         """Disconnect from the gateway."""
         self._stop_heartbeat()
+        self._cancel_startup_bootstrap()
         self._cancel_reconnect()
         self._connected = False
         self._authenticated = False
@@ -1064,15 +1216,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("OneControl %s — notifications enabled, waiting for SEED", self.address)
 
         # For non-PIN gateways authenticated in step 1, start the heartbeat now.
-        # PIN gateways start it in _authenticate_step2 after the SEED handshake.
-        if self._authenticated:
-            self._start_heartbeat()
-
-        # Send an initial GetDevices command to wake the gateway before metadata
-        # is requested.  Mirrors v2.7.2 Android plugin: GetDevices at T+500ms,
-        # metadata at T+1500ms.  Older gateway firmware requires the device-list
-        # request to be processed before it will serve GetDevicesMetadata.
-        self.hass.async_create_task(self._send_initial_get_devices())
+        # PIN gateways become authenticated in _authenticate_step2 after the
+        # SEED handshake.  Query bootstrap and heartbeat start after GatewayInfo
+        # so startup commands stay serialized.
 
         # ── Persist bonded source ─────────────────────────────────────
         # Step 1 auth succeeded (reached here without exception), so the
@@ -1200,7 +1346,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Step 2: auth key written — authentication complete")
             self._authenticated = True
             self.async_set_updated_data(self._build_data())
-            self._start_heartbeat()
         except BleakError as exc:
             _LOGGER.error("Step 2: failed to write KEY: %s", exc)
 
@@ -1232,6 +1377,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await asyncio.sleep(10.0)
         if not self._connected:
             return
+        if self._is_startup_bootstrap_active(table_id):
+            _LOGGER.debug(
+                "Retry for metadata table %d suppressed — startup bootstrap active",
+                table_id,
+            )
+            return
         if table_id in self._metadata_loaded_tables:
             return
         _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
@@ -1258,7 +1409,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         as a fallback when it stores the first GatewayInfo event.
         """
         await asyncio.sleep(0.5)
-        await self._do_send_initial_get_devices()
+        if self.gateway_info is not None:
+            self._ensure_startup_bootstrap(self.gateway_info.table_id)
 
     async def _do_send_initial_get_devices(self) -> None:
         """Send the initial GetDevices command if not already sent.
@@ -1272,16 +1424,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.gateway_info is None:
             return
         try:
-            cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
-            cmd_id = int.from_bytes(cmd[0:2], "little")
-            self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
-            if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
-                self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
-            self._cmd_correlation_stats["pending_get_devices_peak"] = max(
-                self._cmd_correlation_stats["pending_get_devices_peak"],
-                len(self._pending_get_devices_cmdids),
-            )
-            await self.async_send_command(cmd)
+            cmd_id = await self._send_get_devices_request(self.gateway_info.table_id)
             self._initial_get_devices_sent = True
             _LOGGER.debug(
                 "Initial GetDevices sent for table %d (cmdId=%d)",
@@ -1298,6 +1441,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         request before we ask for metadata.
         """
         await asyncio.sleep(1.5)
+        if self._is_startup_bootstrap_active(table_id):
+            _LOGGER.debug(
+                "Metadata request for table %d suppressed — startup bootstrap active",
+                table_id,
+            )
+            return
         if table_id in self._metadata_loaded_tables:
             return
         if table_id in self._metadata_requested_tables:
@@ -1325,6 +1474,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or table_id in self._metadata_requested_tables
         ):
             return
+        if self._is_startup_bootstrap_active(table_id):
+            _LOGGER.debug(
+                "Observed table_id=%d while startup bootstrap is active — waiting",
+                table_id,
+            )
+            return
         if table_id not in self._get_devices_loaded_tables:
             self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
             _LOGGER.debug(
@@ -1341,6 +1496,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _start_heartbeat(self) -> None:
         """Start the heartbeat loop after authentication."""
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            return
         self._stop_heartbeat()
         self._heartbeat_task = self.hass.async_create_background_task(
             self._heartbeat_loop(), name="ha_onecontrol_heartbeat"
@@ -1385,16 +1542,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     break
 
                 try:
-                    cmd = self._cmd.build_get_devices(self.gateway_info.table_id)
-                    cmd_id = int.from_bytes(cmd[0:2], "little")
-                    self._pending_get_devices_cmdids[cmd_id] = self.gateway_info.table_id
-                    if len(self._pending_get_devices_cmdids) > _MAX_PENDING_GET_DEVICES_CMDIDS:
-                        self._pending_get_devices_cmdids.pop(next(iter(self._pending_get_devices_cmdids)))
-                    self._cmd_correlation_stats["pending_get_devices_peak"] = max(
-                        self._cmd_correlation_stats["pending_get_devices_peak"],
-                        len(self._pending_get_devices_cmdids),
-                    )
-                    await self.async_send_command(cmd)
+                    if self._is_startup_bootstrap_active(self.gateway_info.table_id):
+                        continue
+                    await self._send_get_devices_request(self.gateway_info.table_id)
                 except BleakError as exc:
                     _LOGGER.warning("Heartbeat BLE write failed: %s", exc)
                     break
@@ -1441,6 +1591,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if completed_get_devices_table is not None:
                     self._cmd_correlation_stats["get_devices_completed"] += 1
                     self._get_devices_loaded_tables.add(completed_get_devices_table)
+                    self._resolve_bootstrap_waiter(
+                        "get_devices", completed_get_devices_table, "completed"
+                    )
                     _LOGGER.debug(
                         "GetDevices completion frame (cmdId=%d table=%d, loaded_tables=%d)",
                         cmd_id,
@@ -1450,6 +1603,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if (
                         completed_get_devices_table not in self._metadata_loaded_tables
                         and completed_get_devices_table not in self._metadata_requested_tables
+                        and not self._is_startup_bootstrap_active(completed_get_devices_table)
                     ):
                         _LOGGER.debug(
                             "Scheduling metadata request after GetDevices completion for table %d",
@@ -1501,6 +1655,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._metadata_loaded_tables.add(completed_table)
                         self._last_metadata_crc = response_crc
                         self._cmd_correlation_stats["metadata_commit_success"] += 1
+                        self._resolve_bootstrap_waiter("metadata", completed_table, "completed")
                         _LOGGER.debug(
                             "Metadata completion OK for table %d (CRC=0x%08x, entries=%d)",
                             completed_table,
@@ -1514,10 +1669,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._pending_metadata_entries.pop(cmd_id, None)
                 if rejected_table is not None:
                     error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
+                    rejection_result = (
+                        f"rejected:0x{error_code:02x}" if error_code >= 0 else "rejected"
+                    )
                     if error_code == 0x0F:
                         retry_count = self._metadata_retry_counts.get(rejected_table, 0) + 1
                         self._metadata_retry_counts[rejected_table] = retry_count
                         self._cmd_correlation_stats["metadata_retry_scheduled"] += 1
+                        self._resolve_bootstrap_waiter("metadata", rejected_table, rejection_result)
                         _LOGGER.warning(
                             "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
                             " — scheduling retry #%d in 10s",
@@ -1528,6 +1687,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             self._retry_metadata_after_rejection(rejected_table)
                         )
                     else:
+                        self._resolve_bootstrap_waiter("metadata", rejected_table, rejection_result)
                         _LOGGER.warning(
                             "Metadata request failed for table_id=%d (errorCode=0x%02x)",
                             rejected_table,
@@ -1540,8 +1700,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._cmd_correlation_stats["get_devices_rejected"] += 1
                         self._get_devices_loaded_tables.discard(gd_table)
                         error_code = frame[4] & 0xFF if len(frame) >= 5 else -1
+                        rejection_result = (
+                            f"rejected:0x{error_code:02x}" if error_code >= 0 else "rejected"
+                        )
                         reject_count = self._get_devices_reject_counts.get(gd_table, 0) + 1
                         self._get_devices_reject_counts[gd_table] = reject_count
+                        self._resolve_bootstrap_waiter("get_devices", gd_table, rejection_result)
                         if reject_count >= _GET_DEVICES_REJECTION_BYPASS_COUNT:
                             _LOGGER.warning(
                                 "GetDevices rejected %d times for table_id=%d "
@@ -1553,6 +1717,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if (
                                 gd_table not in self._metadata_loaded_tables
                                 and gd_table not in self._metadata_requested_tables
+                                and not self._is_startup_bootstrap_active(gd_table)
                             ):
                                 self.hass.async_create_task(
                                     self._send_metadata_request(gd_table)
@@ -1672,27 +1837,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             self.gateway_info = event
 
-            # Belt-and-suspenders: if GatewayInfo arrived after the T+0.5s
-            # window (so _send_initial_get_devices bailed), send GetDevices now
-            # so it still precedes the metadata request below.
-            if not self._initial_get_devices_sent:
-                self.hass.async_create_task(self._do_send_initial_get_devices())
-
-            # Schedule metadata request if not already handled by CRC gate above.
-            if (
-                event.table_id not in self._metadata_loaded_tables
-                and event.table_id not in self._metadata_requested_tables
-            ):
-                if event.table_id in self._get_devices_loaded_tables:
-                    self.hass.async_create_task(
-                        self._request_metadata_after_delay(event.table_id)
-                    )
-                else:
-                    self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-                    _LOGGER.debug(
-                        "GatewayInfo table %d waiting for GetDevices completion before metadata request",
-                        event.table_id,
-                    )
+            self._ensure_startup_bootstrap(event.table_id)
 
         elif isinstance(event, RvStatus):
             self.rv_status = event
@@ -1871,6 +2016,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_get_devices_cmdids.clear()
         self._get_devices_loaded_tables.clear()
         self._get_devices_reject_counts.clear()
+        self._cancel_startup_bootstrap()
         self._unknown_command_counts.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
