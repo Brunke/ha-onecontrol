@@ -110,6 +110,38 @@ _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS = 30.0
 # Covers gateways that need minutes to fully boot after a power cycle.
 _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 
+# Seconds to wait after metadata loads before seeding relay entities for silent
+# (always-off) devices.  Lets the initial BLE event burst settle first.
+_METADATA_RELAY_SEED_DELAY_S = 2.0
+
+# Function codes that should NOT produce seeded relay-switch entities — these are
+# system/infrastructure devices, not end-user controllable loads.
+_METADATA_SEED_SKIP_CODES: frozenset[int] = frozenset({
+    0,    # Unknown Device
+    1,    # Diagnostic Tool
+    2,    # MyRV Tablet
+    108,  # MyRV Touchscreen
+    183,  # Network Bridge
+    184,  # Ethernet Bridge
+    185,  # WiFi Bridge
+    297,  # AquaFi
+    298,  # Connect Anywhere
+    304,  # Tire Linc
+    320,  # Monitor Panel
+    321,  # Camera
+    322,  # Jayco AUS TBB GW
+    323,  # Gateway RVLink
+    329,  # Trailer Brake Controller
+    352,  # Anti Lock Braking System
+    353,  # LOCAP Gateway
+    354,  # Bootloader
+    364,  # WiFi Booster
+    371,  # Axle1 Brake Controller
+    372,  # Axle2 Brake Controller
+    373,  # Axle3 Brake Controller
+    403,  # Base Camp Touchscreen
+})
+
 
 def _device_key(table_id: int, device_id: int) -> str:
     """Canonical string key for a (table, device) pair."""
@@ -1685,6 +1717,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             response_crc,
                             staged_count,
                         )
+                        self.hass.async_create_task(
+                            self._async_seed_silent_relays(completed_table)
+                        )
                 return
             if response_type == 0x82:
                 cmd_id = (frame[1] & 0xFF) | ((frame[2] & 0xFF) << 8)
@@ -1994,6 +2029,53 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Metadata: %s → func=%d inst=%d → %s",
             key.upper(), meta.function_name, meta.function_instance, name,
         )
+
+    async def _async_seed_silent_relays(self, table_id: int) -> None:
+        """Seed relay-switch entities for metadata-known devices that never emit BLE events.
+
+        Devices that are persistently OFF never broadcast a RelayStatus (0x06) event,
+        so event-driven discovery in switch.py never creates an entity for them.  After
+        waiting _METADATA_RELAY_SEED_DELAY_S for the initial BLE burst to settle, we
+        synthesise a RelayStatus(is_on=False) for every metadata entry that still has
+        no discovered state, then fire it through the normal event-callback chain so
+        switch.py creates the entity just as if a real 0x06 frame had arrived.
+        """
+        await asyncio.sleep(_METADATA_RELAY_SEED_DELAY_S)
+
+        for key, meta in list(self._metadata_raw.items()):
+            if meta.table_id != table_id:
+                continue
+            if meta.function_name in _METADATA_SEED_SKIP_CODES:
+                continue
+            # Already discovered via a live event of any recognised type — skip.
+            if (
+                key in self.relays
+                or key in self.dimmable_lights
+                or key in self.rgb_lights
+                or key in self.covers
+                or key in self.tanks
+                or key in self.hvac_zones
+                or key in self.generators
+                or key in self.hour_meters
+                or key in self.device_locks
+            ):
+                continue
+            stub = RelayStatus(
+                table_id=meta.table_id,
+                device_id=meta.device_id,
+                is_on=False,
+            )
+            self.relays[key] = stub
+            _LOGGER.info(
+                "Seeding silent relay entity for %s (func=%d) from metadata",
+                self.device_names.get(key, key),
+                meta.function_name,
+            )
+            for cb in self._event_callbacks:
+                try:
+                    cb(stub)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Error in event callback during relay seed")
 
     def _build_data(self) -> dict[str, Any]:
         """Build the coordinator data dict consumed by entities."""
