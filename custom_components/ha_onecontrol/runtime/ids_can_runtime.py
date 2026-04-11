@@ -42,6 +42,7 @@ _LOGGER = logging.getLogger(__name__)
 _IDS_SESSION_REMOTE_CONTROL = 0x0004
 _IDS_SESSION_REMOTE_CONTROL_CYPHER = 0xB16B5E95
 _IDS_COMMAND_SETTLE_WINDOW_S = 1.2
+_HVAC_INVALID_TEMPERATURE_RAW_VALUES = {0x8000, 0x2FF0}
 
 
 class IdsCanRuntime:
@@ -123,6 +124,15 @@ class IdsCanRuntime:
             c = (c + (((s << 4) + 1948272964) ^ (s + summation) ^ ((s >> 5) + 1400073827))) & 0xFFFFFFFF
             summation = (summation + delta) & 0xFFFFFFFF
         return s
+
+    @staticmethod
+    def _decode_hvac_temp_88(raw: int) -> float | None:
+        """Decode signed big-endian 8.8 HVAC temperature with native invalid markers."""
+        value = raw & 0xFFFF
+        if value in _HVAC_INVALID_TEMPERATURE_RAW_VALUES:
+            return None
+        signed = value - 0x10000 if value >= 0x8000 else value
+        return signed / 256.0
 
     async def _send_ids_request(self, target_address: int, request_code: int, payload: bytes) -> bool:
         """Send one IDS REQUEST(0x80) frame to target over Ethernet."""
@@ -437,6 +447,7 @@ class IdsCanRuntime:
         product_id = int(semantic_fields.get("product_id", 0))
         device_type = int(semantic_fields.get("device_type", 0))
         device_instance = int(semantic_fields.get("device_instance", 0))
+        raw_device_capability = int(semantic_fields.get("device_capabilities", 0))
         product_mac = self._ids_source_product_mac.get(device_id, "")
 
         identity = DeviceIdentity(
@@ -447,6 +458,7 @@ class IdsCanRuntime:
             device_instance=device_instance,
             product_id=product_id,
             product_mac=product_mac,
+            raw_device_capability=raw_device_capability,
         )
         key = f"{table_id:02x}:{device_id:02x}"
         self._ids_source_identities[device_id] = identity
@@ -470,7 +482,7 @@ class IdsCanRuntime:
         status0 = payload[0] & 0xFF
         on_state = (status0 & 0x01) != 0
 
-        if identity.device_type in {20, 30} and not self._should_accept_status(
+        if identity.device_type in {13, 20, 30} and not self._should_accept_status(
             identity.device_type,
             device_id,
             on_state,
@@ -510,6 +522,36 @@ class IdsCanRuntime:
                 brightness=current.brightness if current else 255,
             )
             self._c.rgb_lights[key] = event
+            emitted_event = event
+        elif identity.device_type == 16 and len(payload) >= 8:
+            cmd = payload[0] & 0xFF
+            low_trip_f = payload[1] & 0xFF
+            high_trip_f = payload[2] & 0xFF
+            zone_status = payload[3] & 0x8F
+            indoor_raw = ((payload[4] & 0xFF) << 8) | (payload[5] & 0xFF)
+            outdoor_raw = ((payload[6] & 0xFF) << 8) | (payload[7] & 0xFF)
+            dtc_code = int.from_bytes(payload[8:10], "big") if len(payload) >= 10 else 0
+
+            event = HvacZone(
+                table_id=table_id,
+                device_id=device_id,
+                heat_mode=cmd & 0x07,
+                heat_source=(cmd >> 4) & 0x03,
+                fan_mode=(cmd >> 6) & 0x03,
+                low_trip_f=low_trip_f,
+                high_trip_f=high_trip_f,
+                zone_status=zone_status,
+                indoor_temp_f=self._decode_hvac_temp_88(indoor_raw),
+                outdoor_temp_f=self._decode_hvac_temp_88(outdoor_raw),
+                dtc_code=dtc_code,
+            )
+            handle_hvac_zone = getattr(self._c, "_handle_hvac_zone", None)
+            if callable(handle_hvac_zone):
+                handle_hvac_zone(event)
+            else:
+                self._c.hvac_zones[key] = event
+                if hasattr(self._c, "_hvac_zone_states"):
+                    self._c._hvac_zone_states[key] = event
             emitted_event = event
         elif identity.device_type == 33:
             position = payload[1] & 0xFF if len(payload) >= 2 and payload[1] != 0xFF else None
@@ -761,9 +803,14 @@ class IdsCanRuntime:
         Returns True when IDS-native command path was used and written.
         Returns False when prerequisites are missing so callers can fallback.
         """
+        brightness = 255 if turn_on else 0
+        return await self.send_light_brightness_command(table_id, device_id, brightness)
+
+    async def send_light_brightness_command(self, table_id: int, device_id: int, brightness: int) -> bool:
+        """Send IDS dimmable brightness command using native 8-byte payload."""
         if not self._c.is_ethernet_gateway or not self._c._connected or self._c._eth_writer is None:
             _LOGGER.warning(
-                "PACKET TX IDS light-toggle skipped table=0x%02X device=0x%02X reason=transport-not-ready",
+                "PACKET TX IDS light-set skipped table=0x%02X device=0x%02X reason=transport-not-ready",
                 table_id & 0xFF,
                 device_id & 0xFF,
             )
@@ -772,7 +819,7 @@ class IdsCanRuntime:
         resolved = self._resolve_ids_identity(table_id, device_id, expected_device_type=20)
         if resolved is None:
             _LOGGER.warning(
-                "PACKET TX IDS light-toggle skipped table=0x%02X device=0x%02X reason=identity-not-found",
+                "PACKET TX IDS light-set skipped table=0x%02X device=0x%02X reason=identity-not-found",
                 table_id & 0xFF,
                 device_id & 0xFF,
             )
@@ -781,7 +828,7 @@ class IdsCanRuntime:
         key, identity = resolved
         if identity.protocol != 2 or identity.device_type != 20:
             _LOGGER.warning(
-                "PACKET TX IDS light-toggle skipped key=%s reason=identity-mismatch protocol=%d device_type=%d",
+                "PACKET TX IDS light-set skipped key=%s reason=identity-mismatch protocol=%d device_type=%d",
                 key,
                 identity.protocol,
                 identity.device_type,
@@ -792,12 +839,9 @@ class IdsCanRuntime:
         if not session_ok:
             return False
 
-        # Dimmable light command packet parity:
-        # commandByte=0x00, data[0]=mode(0=Off,1=On), fixed 8-byte payload.
-        if turn_on:
-            payload = bytes([0x01, 0xFF, 0x00, 0x00, 0xDC, 0x00, 0xDC, 0x00])
-        else:
-            payload = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        clamped_brightness = min(max(brightness, 0), 255)
+        mode = 0x00 if clamped_brightness == 0 else 0x01
+        payload = bytes([mode, clamped_brightness, 0x00, 0x00, 0xDC, 0x00, 0xDC, 0x00])
 
         raw = compose_ids_can_extended_wire_frame(
             message_type=0x82,
@@ -813,22 +857,325 @@ class IdsCanRuntime:
 
         # Optimistic state mirrors BLE behavior and is corrected by incoming status.
         self._ensure_event_store_maps()
-        brightness = 255 if turn_on else 0
         event = DimmableLight(
             table_id=table_id & 0xFF,
             device_id=device_id & 0xFF,
-            brightness=brightness,
-            mode=1 if turn_on else 0,
+            brightness=clamped_brightness,
+            mode=mode,
         )
         self._c.dimmable_lights[key] = event
         self._dispatch_state_event(event)
-        self._set_pending_status_expectation(identity.device_type, device_id, turn_on)
+        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
 
         _LOGGER.warning(
-            "PACKET TX IDS light-toggle src=0x%02X dst=0x%02X cmd=0x00 on=%s payload=%s raw=%s",
+            "PACKET TX IDS light-set src=0x%02X dst=0x%02X cmd=0x00 mode=0x%02X brightness=%d payload=%s raw=%s",
             self._ids_controller_source_address & 0xFF,
             device_id & 0xFF,
-            turn_on,
+            mode,
+            clamped_brightness,
+            payload.hex(),
+            raw.hex(),
+        )
+        return True
+
+    async def send_light_effect_command(
+        self,
+        table_id: int,
+        device_id: int,
+        mode: int,
+        brightness: int,
+        duration: int,
+        cycle_time1: int,
+        cycle_time2: int,
+    ) -> bool:
+        """Send IDS dimmable effect command (blink/swell) via COMMAND(0x82)."""
+        if not self._c.is_ethernet_gateway or not self._c._connected or self._c._eth_writer is None:
+            _LOGGER.warning(
+                "PACKET TX IDS light-effect skipped table=0x%02X device=0x%02X reason=transport-not-ready",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        resolved = self._resolve_ids_identity(table_id, device_id, expected_device_type=20)
+        if resolved is None:
+            _LOGGER.warning(
+                "PACKET TX IDS light-effect skipped table=0x%02X device=0x%02X reason=identity-not-found",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        key, identity = resolved
+        if identity.protocol != 2 or identity.device_type != 20:
+            _LOGGER.warning(
+                "PACKET TX IDS light-effect skipped key=%s reason=identity-mismatch protocol=%d device_type=%d",
+                key,
+                identity.protocol,
+                identity.device_type,
+            )
+            return False
+
+        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
+        if not session_ok:
+            return False
+
+        effect_mode = mode & 0xFF
+        clamped_brightness = min(max(brightness, 0), 255)
+        dur = duration & 0xFF
+        ct1 = min(max(cycle_time1, 0), 0xFFFF)
+        ct2 = min(max(cycle_time2, 0), 0xFFFF)
+        # Dimmable effect payload parity uses little-endian cycle timing fields.
+        payload = bytes([
+            effect_mode,
+            clamped_brightness,
+            dur,
+            0x00,
+            ct1 & 0xFF,
+            (ct1 >> 8) & 0xFF,
+            ct2 & 0xFF,
+            (ct2 >> 8) & 0xFF,
+        ])
+
+        raw = compose_ids_can_extended_wire_frame(
+            message_type=0x82,
+            source_address=self._ids_controller_source_address,
+            target_address=device_id & 0xFF,
+            message_data=0x00,
+            payload=payload,
+        )
+        self._record_recent_command_target(device_id & 0xFF)
+        self._c._eth_writer.write(cobs_encode(raw))
+        await self._c._eth_writer.drain()
+        self._c._last_ethernet_tx_time = time.monotonic()
+
+        # Optimistic state mirrors requested brightness/effect mode until status arrives.
+        self._ensure_event_store_maps()
+        event = DimmableLight(
+            table_id=table_id & 0xFF,
+            device_id=device_id & 0xFF,
+            brightness=clamped_brightness,
+            mode=effect_mode,
+        )
+        self._c.dimmable_lights[key] = event
+        self._dispatch_state_event(event)
+        self._set_pending_status_expectation(identity.device_type, device_id, clamped_brightness > 0)
+
+        _LOGGER.warning(
+            "PACKET TX IDS light-effect src=0x%02X dst=0x%02X mode=0x%02X brightness=%d duration=%d ct1=%d ct2=%d payload=%s raw=%s",
+            self._ids_controller_source_address & 0xFF,
+            device_id & 0xFF,
+            effect_mode,
+            clamped_brightness,
+            dur,
+            ct1,
+            ct2,
+            payload.hex(),
+            raw.hex(),
+        )
+        return True
+
+    async def send_rgb_command(
+        self,
+        table_id: int,
+        device_id: int,
+        mode: int = 0x01,
+        red: int = 255,
+        green: int = 255,
+        blue: int = 255,
+        auto_off: int = 0,
+        blink_on_interval: int = 0,
+        blink_off_interval: int = 0,
+        transition_interval: int = 1000,
+    ) -> bool:
+        """Send IDS RGB command as COMMAND(0x82) with native 8-byte payload."""
+        if not self._c.is_ethernet_gateway or not self._c._connected or self._c._eth_writer is None:
+            _LOGGER.warning(
+                "PACKET TX IDS rgb-set skipped table=0x%02X device=0x%02X reason=transport-not-ready",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        resolved = self._resolve_ids_identity(table_id, device_id, expected_device_type=13)
+        if resolved is None:
+            _LOGGER.warning(
+                "PACKET TX IDS rgb-set skipped table=0x%02X device=0x%02X reason=identity-not-found",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        key, identity = resolved
+        if identity.protocol != 2 or identity.device_type != 13:
+            _LOGGER.warning(
+                "PACKET TX IDS rgb-set skipped key=%s reason=identity-mismatch protocol=%d device_type=%d",
+                key,
+                identity.protocol,
+                identity.device_type,
+            )
+            return False
+
+        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
+        if not session_ok:
+            return False
+
+        mode_byte = mode & 0xFF
+        r = min(max(red, 0), 255)
+        g = min(max(green, 0), 255)
+        b = min(max(blue, 0), 255)
+        auto = auto_off & 0xFF
+        interval_msb = 0
+        interval_lsb = 0
+
+        if mode_byte == 0x02:
+            interval_msb = blink_on_interval & 0xFF
+            interval_lsb = blink_off_interval & 0xFF
+        elif 0x04 <= mode_byte <= 0x08:
+            interval = min(max(transition_interval, 0), 0xFFFF)
+            interval_msb = (interval >> 8) & 0xFF
+            interval_lsb = interval & 0xFF
+
+        payload = bytes([mode_byte, r, g, b, auto, interval_msb, interval_lsb, 0x00])
+
+        raw = compose_ids_can_extended_wire_frame(
+            message_type=0x82,
+            source_address=self._ids_controller_source_address,
+            target_address=device_id & 0xFF,
+            message_data=0x00,
+            payload=payload,
+        )
+        self._record_recent_command_target(device_id & 0xFF)
+        self._c._eth_writer.write(cobs_encode(raw))
+        await self._c._eth_writer.drain()
+        self._c._last_ethernet_tx_time = time.monotonic()
+
+        self._ensure_event_store_maps()
+        current = self._c.rgb_lights.get(key)
+        brightness = current.brightness if current else 255
+        if mode_byte == 0x00:
+            brightness = 0
+        elif mode_byte in {0x01, 0x02}:
+            brightness = max(r, g, b)
+        event = RgbLight(
+            table_id=table_id & 0xFF,
+            device_id=device_id & 0xFF,
+            mode=mode_byte,
+            red=r,
+            green=g,
+            blue=b,
+            brightness=brightness,
+        )
+        self._c.rgb_lights[key] = event
+        self._dispatch_state_event(event)
+        self._set_pending_status_expectation(identity.device_type, device_id, mode_byte > 0)
+
+        _LOGGER.warning(
+            "PACKET TX IDS rgb-set src=0x%02X dst=0x%02X mode=0x%02X rgb=(%d,%d,%d) auto_off=%d i1=0x%02X i2=0x%02X payload=%s raw=%s",
+            self._ids_controller_source_address & 0xFF,
+            device_id & 0xFF,
+            mode_byte,
+            r,
+            g,
+            b,
+            auto,
+            interval_msb,
+            interval_lsb,
+            payload.hex(),
+            raw.hex(),
+        )
+        return True
+
+    async def send_hvac_command(
+        self,
+        table_id: int,
+        device_id: int,
+        heat_mode: int = 0,
+        heat_source: int = 0,
+        fan_mode: int = 0,
+        low_trip_f: int = 65,
+        high_trip_f: int = 78,
+    ) -> bool:
+        """Send IDS HVAC command as COMMAND(0x82) with native 3-byte payload."""
+        if not self._c.is_ethernet_gateway or not self._c._connected or self._c._eth_writer is None:
+            _LOGGER.warning(
+                "PACKET TX IDS hvac-set skipped table=0x%02X device=0x%02X reason=transport-not-ready",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        resolved = self._resolve_ids_identity(table_id, device_id, expected_device_type=16)
+        if resolved is None:
+            _LOGGER.warning(
+                "PACKET TX IDS hvac-set skipped table=0x%02X device=0x%02X reason=identity-not-found",
+                table_id & 0xFF,
+                device_id & 0xFF,
+            )
+            return False
+
+        key, identity = resolved
+        if identity.protocol != 2 or identity.device_type != 16:
+            _LOGGER.warning(
+                "PACKET TX IDS hvac-set skipped key=%s reason=identity-mismatch protocol=%d device_type=%d",
+                key,
+                identity.protocol,
+                identity.device_type,
+            )
+            return False
+
+        session_ok = await self.ensure_remote_control_session(device_id & 0xFF)
+        if not session_ok:
+            return False
+
+        command_byte = (
+            (heat_mode & 0x07)
+            | ((heat_source & 0x03) << 4)
+            | ((fan_mode & 0x03) << 6)
+        )
+        low = min(max(low_trip_f, 0), 255)
+        high = min(max(high_trip_f, 0), 255)
+        payload = bytes([command_byte & 0xFF, low, high])
+
+        raw = compose_ids_can_extended_wire_frame(
+            message_type=0x82,
+            source_address=self._ids_controller_source_address,
+            target_address=device_id & 0xFF,
+            message_data=0x00,
+            payload=payload,
+        )
+        self._record_recent_command_target(device_id & 0xFF)
+        self._c._eth_writer.write(cobs_encode(raw))
+        await self._c._eth_writer.drain()
+        self._c._last_ethernet_tx_time = time.monotonic()
+
+        self._ensure_event_store_maps()
+        current = self._c.hvac_zones.get(key)
+        event = HvacZone(
+            table_id=table_id & 0xFF,
+            device_id=device_id & 0xFF,
+            heat_mode=command_byte & 0x07,
+            heat_source=(command_byte >> 4) & 0x03,
+            fan_mode=(command_byte >> 6) & 0x03,
+            low_trip_f=low,
+            high_trip_f=high,
+            zone_status=current.zone_status if current else 0,
+            indoor_temp_f=current.indoor_temp_f if current else None,
+            outdoor_temp_f=current.outdoor_temp_f if current else None,
+            dtc_code=current.dtc_code if current else 0,
+        )
+        self._c.hvac_zones[key] = event
+        if hasattr(self._c, "_hvac_zone_states"):
+            self._c._hvac_zone_states[key] = event
+        self._dispatch_state_event(event)
+
+        _LOGGER.warning(
+            "PACKET TX IDS hvac-set src=0x%02X dst=0x%02X cmd=0x%02X low=%d high=%d payload=%s raw=%s",
+            self._ids_controller_source_address & 0xFF,
+            device_id & 0xFF,
+            command_byte & 0xFF,
+            low,
+            high,
             payload.hex(),
             raw.hex(),
         )

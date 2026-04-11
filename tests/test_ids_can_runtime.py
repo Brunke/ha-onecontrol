@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from custom_components.ha_onecontrol.protocol.cobs import CobsByteDecoder
-from custom_components.ha_onecontrol.protocol.events import DeviceMetadata
+from custom_components.ha_onecontrol.protocol.events import DeviceIdentity, DeviceMetadata, HvacZone
 from custom_components.ha_onecontrol.protocol.ids_can_wire import parse_ids_can_wire_frame
 from custom_components.ha_onecontrol.runtime.ids_can_runtime import IdsCanRuntime
 
@@ -564,6 +564,94 @@ def test_ids_runtime_send_relay_toggle_command_writes_extended_ids_frame() -> No
     assert relay.status_byte == 0x01
 
 
+def test_ids_runtime_send_light_brightness_command_writes_brightness_payload() -> None:
+    """send_light_brightness_command should preserve requested brightness in payload."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime.handle_frame(bytes.fromhex("0800cd031400000008e9cd"))
+    runtime.handle_frame(bytes.fromhex("0802cd0067cd14002740d0"))
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCD] = time.monotonic()
+
+    used = asyncio.run(runtime.send_light_brightness_command(0x03, 0xCD, 82))
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCD
+    assert parsed.message_data == 0x00
+    assert parsed.payload == bytes.fromhex("01520000dc00dc00")
+
+    light = state.dimmable_lights.get("03:cd")
+    assert light is not None
+    assert light.mode == 1
+    assert light.brightness == 82
+
+
+def test_ids_runtime_send_light_effect_command_writes_effect_payload() -> None:
+    """send_light_effect_command should emit effect mode and timing payload fields."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime.handle_frame(bytes.fromhex("0800cd031400000008e9cd"))
+    runtime.handle_frame(bytes.fromhex("0802cd0067cd14002740d0"))
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCD] = time.monotonic()
+
+    used = asyncio.run(
+        runtime.send_light_effect_command(
+            0x03,
+            0xCD,
+            mode=0x02,
+            brightness=128,
+            duration=5,
+            cycle_time1=1055,
+            cycle_time2=2447,
+        )
+    )
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCD
+    assert parsed.message_data == 0x00
+    # mode=0x02, brightness=0x80, duration=0x05, reserved=0x00,
+    # cycle1=1055=>0x041F (little-endian 1f04), cycle2=2447=>0x098F (8f09)
+    assert parsed.payload == bytes.fromhex("028005001f048f09")
+
+    light = state.dimmable_lights.get("03:cd")
+    assert light is not None
+    assert light.mode == 0x02
+    assert light.brightness == 128
+
+
 def test_ids_runtime_light_toggle_uses_device_id_fallback_when_table_mismatch() -> None:
     """Light toggle should still send when requested table id differs but device id/type match."""
     state = _base_state()
@@ -624,3 +712,239 @@ def test_ids_runtime_relay_toggle_uses_device_id_fallback_when_table_mismatch() 
     assert parsed is not None
     assert parsed.target_address == 0xDA
     assert parsed.message_type == 0x82
+
+
+def test_ids_runtime_send_rgb_command_writes_solid_payload() -> None:
+    """send_rgb_command should emit native 8-byte RGB payload for solid mode."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime.handle_frame(bytes.fromhex("0800ce031400000008e9ce"))
+    runtime.handle_frame(bytes.fromhex("0802ce0067ce0d002740d0"))
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCE] = time.monotonic()
+
+    used = asyncio.run(
+        runtime.send_rgb_command(
+            0x03,
+            0xCE,
+            mode=0x01,
+            red=0x11,
+            green=0x22,
+            blue=0x33,
+            auto_off=0x04,
+        )
+    )
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCE
+    assert parsed.message_data == 0x00
+    assert parsed.payload == bytes.fromhex("0111223304000000")
+
+    light = state.rgb_lights.get("03:ce")
+    assert light is not None
+    assert light.mode == 0x01
+    assert (light.red, light.green, light.blue) == (0x11, 0x22, 0x33)
+
+
+def test_ids_runtime_send_rgb_command_writes_transition_payload() -> None:
+    """Transition RGB modes should encode transition interval as big-endian."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime.handle_frame(bytes.fromhex("0800ce031400000008e9ce"))
+    runtime.handle_frame(bytes.fromhex("0802ce0067ce0d002740d0"))
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCE] = time.monotonic()
+
+    used = asyncio.run(
+        runtime.send_rgb_command(
+            0x03,
+            0xCE,
+            mode=0x08,
+            auto_off=0x09,
+            transition_interval=0x1234,
+        )
+    )
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCE
+    assert parsed.message_data == 0x00
+    assert parsed.payload == bytes.fromhex("08ffffff09123400")
+
+
+def test_ids_runtime_send_rgb_command_writes_off_payload() -> None:
+    """Off RGB command should set mode byte to 0x00 in native payload."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime.handle_frame(bytes.fromhex("0800ce031400000008e9ce"))
+    runtime.handle_frame(bytes.fromhex("0802ce0067ce0d002740d0"))
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCE] = time.monotonic()
+
+    used = asyncio.run(runtime.send_rgb_command(0x03, 0xCE, mode=0x00))
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCE
+    assert parsed.message_data == 0x00
+    assert parsed.payload[0] == 0x00
+
+    light = state.rgb_lights.get("03:ce")
+    assert light is not None
+    assert light.mode == 0x00
+
+
+def test_ids_runtime_send_hvac_command_writes_native_payload() -> None:
+    """send_hvac_command should emit native 3-byte HVAC payload and optimistic state."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    state._device_identities["03:cf"] = DeviceIdentity(
+        table_id=0x03,
+        device_id=0xCF,
+        protocol=2,
+        device_type=16,
+        device_instance=0,
+        product_id=0,
+        product_mac="",
+    )
+    state.hvac_zones["03:cf"] = HvacZone(
+        table_id=0x03,
+        device_id=0xCF,
+        heat_mode=0,
+        heat_source=0,
+        fan_mode=0,
+        low_trip_f=68,
+        high_trip_f=72,
+        zone_status=1,
+        indoor_temp_f=70,
+        outdoor_temp_f=55,
+        dtc_code=0,
+    )
+
+    import asyncio
+    import time
+
+    runtime._ids_session_opened_at[0xCF] = time.monotonic()
+
+    used = asyncio.run(
+        runtime.send_hvac_command(
+            0x03,
+            0xCF,
+            heat_mode=3,
+            heat_source=1,
+            fan_mode=2,
+            low_trip_f=66,
+            high_trip_f=79,
+        )
+    )
+    assert used is True
+
+    writer = state._eth_writer
+    decoder = CobsByteDecoder(use_crc=True)
+    raw = None
+    for byte_val in writer.writes[-1]:
+        raw = decoder.decode_byte(byte_val)
+        if raw is not None:
+            break
+
+    assert raw is not None
+    parsed = parse_ids_can_wire_frame(raw)
+    assert parsed is not None
+    assert parsed.message_type == 0x82
+    assert parsed.target_address == 0xCF
+    assert parsed.message_data == 0x00
+    assert parsed.payload == bytes([0x93, 66, 79])
+
+    zone = state.hvac_zones.get("03:cf")
+    assert zone is not None
+    assert zone.heat_mode == 3
+    assert zone.heat_source == 1
+    assert zone.fan_mode == 2
+    assert zone.low_trip_f == 66
+    assert zone.high_trip_f == 79
+
+
+def test_ids_runtime_hvac_device_status_decodes_temperature_feedback() -> None:
+    """IDS HVAC DEVICE_STATUS payload should decode command/setpoint/temperature fields."""
+    state = _base_state()
+    runtime = IdsCanRuntime(state)  # type: ignore[arg-type]
+
+    runtime._ids_source_identities[0xCF] = DeviceIdentity(
+        table_id=0x03,
+        device_id=0xCF,
+        protocol=2,
+        device_type=16,
+        device_instance=0,
+        product_id=0,
+        product_mac="",
+    )
+
+    payload = bytes([
+        0x93,  # heat_mode=3 heat_source=1 fan_mode=2
+        66,    # low trip
+        79,    # high trip
+        0x03,  # zone status
+        0x48, 0x00,  # indoor 72.0F
+        0x37, 0x00,  # outdoor 55.0F
+        0x12, 0x34,  # dtc
+    ])
+    runtime._handle_ids_device_status(0xCF, payload)
+
+    zone = state.hvac_zones.get("03:cf")
+    assert zone is not None
+    assert zone.heat_mode == 3
+    assert zone.heat_source == 1
+    assert zone.fan_mode == 2
+    assert zone.low_trip_f == 66
+    assert zone.high_trip_f == 79
+    assert zone.zone_status == 0x03
+    assert zone.indoor_temp_f == 72.0
+    assert zone.outdoor_temp_f == 55.0
+    assert zone.dtc_code == 0x1234
