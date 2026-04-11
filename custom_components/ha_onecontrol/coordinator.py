@@ -496,21 +496,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Send a dimmable light brightness command."""
         if self.is_ethernet_gateway:
-            used_ids_native = await self._ids_runtime.send_light_toggle_command(
+            used_ids_native = await self._ids_runtime.send_light_brightness_command(
                 table_id,
                 device_id,
-                brightness > 0,
+                brightness,
             )
             if used_ids_native:
                 _LOGGER.warning(
-                    "PACKET TX IDS light-toggle accepted table=0x%02X device=0x%02X brightness=%d (IDS-only mode)",
+                    "PACKET TX IDS light-set accepted table=0x%02X device=0x%02X brightness=%d (IDS-only mode)",
                     table_id & 0xFF,
                     device_id & 0xFF,
                     brightness,
                 )
                 return
             _LOGGER.warning(
-                "PACKET TX IDS light-toggle skipped table=0x%02X device=0x%02X brightness=%d (IDS-only mode; legacy fallback disabled)",
+                "PACKET TX IDS light-set skipped table=0x%02X device=0x%02X brightness=%d (IDS-only mode; legacy fallback disabled)",
                 table_id & 0xFF,
                 device_id & 0xFF,
                 brightness,
@@ -531,6 +531,35 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cycle_time2: int = 1055,
     ) -> None:
         """Send a dimmable light effect command (blink/swell)."""
+        if self.is_ethernet_gateway:
+            used_ids_native = await self._ids_runtime.send_light_effect_command(
+                table_id,
+                device_id,
+                mode,
+                brightness,
+                duration,
+                cycle_time1,
+                cycle_time2,
+            )
+            if used_ids_native:
+                _LOGGER.warning(
+                    "PACKET TX IDS light-effect accepted table=0x%02X device=0x%02X mode=0x%02X brightness=%d duration=%d (IDS-only mode)",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                    mode & 0xFF,
+                    brightness,
+                    duration,
+                )
+                return
+            _LOGGER.warning(
+                "PACKET TX IDS light-effect skipped table=0x%02X device=0x%02X mode=0x%02X brightness=%d (IDS-only mode; legacy fallback disabled)",
+                table_id & 0xFF,
+                device_id & 0xFF,
+                mode & 0xFF,
+                brightness,
+            )
+            return
+
         cmd = self._cmd.build_action_dimmable_effect(
             table_id, device_id, mode, brightness, duration, cycle_time1, cycle_time2,
         )
@@ -549,10 +578,44 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         is_preset_change: bool = False,
     ) -> None:
         """Send an HVAC command and register a pending command guard."""
-        cmd = self._cmd.build_action_hvac(
-            table_id, device_id, heat_mode, heat_source, fan_mode, low_trip_f, high_trip_f
-        )
-        await self.async_send_command(cmd)
+        command_sent = False
+        if self.is_ethernet_gateway:
+            used_ids_native = await self._ids_runtime.send_hvac_command(
+                table_id=table_id,
+                device_id=device_id,
+                heat_mode=heat_mode,
+                heat_source=heat_source,
+                fan_mode=fan_mode,
+                low_trip_f=low_trip_f,
+                high_trip_f=high_trip_f,
+            )
+            if used_ids_native:
+                command_sent = True
+                _LOGGER.warning(
+                    "PACKET TX IDS hvac-set accepted table=0x%02X device=0x%02X mode=%d source=%d fan=%d low=%d high=%d",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                    heat_mode & 0x07,
+                    heat_source & 0x03,
+                    fan_mode & 0x03,
+                    low_trip_f,
+                    high_trip_f,
+                )
+            else:
+                _LOGGER.warning(
+                    "PACKET TX IDS hvac-set skipped table=0x%02X device=0x%02X reason=ids-path-not-ready",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                )
+        else:
+            cmd = self._cmd.build_action_hvac(
+                table_id, device_id, heat_mode, heat_source, fan_mode, low_trip_f, high_trip_f
+            )
+            await self.async_send_command(cmd)
+            command_sent = True
+
+        if not command_sent:
+            return
 
         key = _device_key(table_id, device_id)
         self._pending_hvac[key] = PendingHvacCommand(
@@ -582,6 +645,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         prev = self.observed_hvac_capability.get(zone_key, 0)
         cap = prev
+
+        identity = self._device_identities.get(zone_key)
+        if identity is not None:
+            cap |= getattr(identity, "raw_device_capability", 0) & 0x0F
 
         active_status = zone.zone_status & 0x0F
         if active_status == 2:
@@ -694,12 +761,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pending.retry_count + 1, HVAC_SETPOINT_MAX_RETRIES, zone_key,
             pending.low_trip_f, pending.high_trip_f,
         )
-        cmd = self._cmd.build_action_hvac(
-            pending.table_id, pending.device_id,
-            pending.heat_mode, pending.heat_source, pending.fan_mode,
-            pending.low_trip_f, pending.high_trip_f,
-        )
-        await self.async_send_command(cmd)
+        if self.is_ethernet_gateway:
+            sent = await self._ids_runtime.send_hvac_command(
+                table_id=pending.table_id,
+                device_id=pending.device_id,
+                heat_mode=pending.heat_mode,
+                heat_source=pending.heat_source,
+                fan_mode=pending.fan_mode,
+                low_trip_f=pending.low_trip_f,
+                high_trip_f=pending.high_trip_f,
+            )
+            if not sent:
+                _LOGGER.warning(
+                    "HVAC setpoint retry skipped for %s (ids-path-not-ready)",
+                    zone_key,
+                )
+        else:
+            cmd = self._cmd.build_action_hvac(
+                pending.table_id, pending.device_id,
+                pending.heat_mode, pending.heat_source, pending.fan_mode,
+                pending.low_trip_f, pending.high_trip_f,
+            )
+            await self.async_send_command(cmd)
         self._pending_hvac[zone_key] = replace(
             pending,
             retry_count=pending.retry_count + 1,
@@ -728,6 +811,37 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         transition_interval: int = 1000,
     ) -> None:
         """Send an RGB light command."""
+        if self.is_ethernet_gateway:
+            used_ids_native = await self._ids_runtime.send_rgb_command(
+                table_id=table_id,
+                device_id=device_id,
+                mode=mode,
+                red=red,
+                green=green,
+                blue=blue,
+                auto_off=auto_off,
+                blink_on_interval=blink_on_interval,
+                blink_off_interval=blink_off_interval,
+                transition_interval=transition_interval,
+            )
+            if used_ids_native:
+                _LOGGER.warning(
+                    "PACKET TX IDS rgb-set accepted table=0x%02X device=0x%02X mode=0x%02X rgb=(%d,%d,%d)",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                    mode & 0xFF,
+                    red & 0xFF,
+                    green & 0xFF,
+                    blue & 0xFF,
+                )
+            else:
+                _LOGGER.warning(
+                    "PACKET TX IDS rgb-set skipped table=0x%02X device=0x%02X reason=ids-path-not-ready",
+                    table_id & 0xFF,
+                    device_id & 0xFF,
+                )
+            return
+
         cmd = self._cmd.build_action_rgb(
             table_id, device_id, mode, red, green, blue,
             auto_off, blink_on_interval, blink_off_interval, transition_interval,

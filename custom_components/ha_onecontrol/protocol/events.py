@@ -280,6 +280,7 @@ class DeviceIdentity:
     device_instance: int = 0
     product_id: int = 0
     product_mac: str = ""
+    raw_device_capability: int = 0
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────

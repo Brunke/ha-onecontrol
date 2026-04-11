@@ -9,12 +9,14 @@ Reference: INTERNALS.md § Dimmable Light, § RGB Light
 
 from __future__ import annotations
 
+import colorsys
 import logging
 from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_EFFECT,
+    ATTR_HS_COLOR,
     ATTR_RGB_COLOR,
     ColorMode,
     LightEntity,
@@ -241,6 +243,31 @@ _RGB_EFFECTS = {
 _EFFECT_NAME_TO_MODE = {k: v for k, v in _RGB_EFFECTS.items()}
 
 
+def _apply_brightness_to_rgb(rgb: tuple[int, int, int], brightness: int) -> tuple[int, int, int]:
+    """Apply native-style RGB brightness using HSV value mapping (5..250 range)."""
+    target = min(max(int(brightness), 0), 255)
+    if target <= 0:
+        return (0, 0, 0)
+
+    r, g, b = (min(max(int(c), 0), 255) for c in rgb)
+    if max(r, g, b) == 0:
+        r = g = b = 255
+
+    rf, gf, bf = r / 255.0, g / 255.0, b / 255.0
+    h, s, _v = colorsys.rgb_to_hsv(rf, gf, bf)
+
+    # Native app path clamps brightness command to [5, 250] then maps to HSV value [0,1].
+    native_brightness = min(max(target, 5), 250)
+    value = (native_brightness - 5) / 245.0
+
+    nr, ng, nb = colorsys.hsv_to_rgb(h, s, value)
+    return (
+        min(max(int(round(nr * 255.0)), 0), 255),
+        min(max(int(round(ng * 255.0)), 0), 255),
+        min(max(int(round(nb * 255.0)), 0), 255),
+    )
+
+
 class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
     """A OneControl RGB light."""
 
@@ -309,12 +336,21 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
 
         # Resolve RGB color
         rgb = kwargs.get(ATTR_RGB_COLOR)
+        hs = kwargs.get(ATTR_HS_COLOR)
         if rgb:
             r, g, b = rgb
+        elif hs:
+            h, s = hs
+            nr, ng, nb = colorsys.hsv_to_rgb(float(h) / 360.0, float(s) / 100.0, 1.0)
+            r, g, b = int(round(nr * 255.0)), int(round(ng * 255.0)), int(round(nb * 255.0))
         elif light:
             r, g, b = light.red, light.green, light.blue
         else:
             r, g, b = 255, 255, 255
+
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        if brightness is not None:
+            r, g, b = _apply_brightness_to_rgb((r, g, b), int(brightness))
 
         # Resolve effect / mode
         effect = kwargs.get(ATTR_EFFECT)
@@ -325,11 +361,17 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         else:
             mode = CommandBuilder.RGB_MODE_SOLID
 
+        # Native behavior only supports direct brightness changes on ON/BLINK-like paths.
+        # If HA sends a brightness-only adjustment while on a transition effect,
+        # force SOLID so the payload RGB bytes represent the new brightness.
+        if brightness is not None and not effect and mode >= CommandBuilder.RGB_MODE_TRANSITION_SOLID:
+            mode = CommandBuilder.RGB_MODE_SOLID
+
         # Optimistic update
         if light:
             self.coordinator.rgb_lights[self._key] = RgbLight(
                 table_id=light.table_id, device_id=light.device_id,
-                mode=mode, red=r, green=g, blue=b, brightness=light.brightness,
+                mode=mode, red=r, green=g, blue=b, brightness=max(r, g, b),
             )
             self.async_write_ha_state()
 
