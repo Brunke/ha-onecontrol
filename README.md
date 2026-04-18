@@ -81,20 +81,20 @@ This approach is experimental. If you are attempting this, use the `pairing\_te
 
 ## Experimental: CAN-to-Ethernet Bridge
 
-The integration now includes an experimental Ethernet path for older OneControl
-systems that expose CAN traffic through an IDS CAN-to-Ethernet bridge.
+The integration now includes an experimental Ethernet path for older OneControl systems that expose CAN traffic through an IDS CAN-to-Ethernet bridge.
 
-1. In config flow, select **CAN-to-Ethernet bridge** as the connection type.
+**Important Note on Device Names:** The legacy CAN-to-Ethernet bridge uses an older IDS-CAN protocol that does not appear to support device metadata retrieval over the network. To get proper device names (instead of generic names like "Switch 1"), you must manually import the device names from the official app's diagnostic data.
 
+### How to get your Device Names:
+1. Open the official OneControl app on your Android/iOS device while connected to your RV.
+2. Generate a diagnostics package through the app settings and email it to yourself.
+3. Extract the zip file on your computer and open both `DeviceManifestV1.json` and `DeviceSnapshotV1.json` in a text editor.
+4. During the Home Assistant configuration flow, you will be prompted for these files. Copy and paste the entire contents of both files into their respective fields. The integration will use this data to automatically name your devices as they are discovered!
+
+### Setup Instructions:
+1. In the HA config flow, select **CAN-to-Ethernet bridge** as the connection type.
 2. The integration listens for UDP advertisements and pre-fills host/port when found.
-
-3. If discovery does not find the bridge, enter host and port manually.
-
-Default bridge values are commonly `192.168.1.1` and `6969`.
-
-The current implementation assumes payload framing compatibility with the BLE
-COBS protocol path. If your bridge wraps frames differently, bridge-specific
-framing support will be needed.
+3. If discovery does not find the bridge, enter the host and port manually. Default bridge values are commonly `192.168.1.1` and `6969`.
 
 ## Supported Devices
 
